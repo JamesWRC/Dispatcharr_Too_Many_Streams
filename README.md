@@ -1,6 +1,6 @@
 
 ## About
-When the configured max stream limit is reached +1. Show a configurable display to users.
+When the configured max stream limit is reached. Show a configurable display to users.
 
 # Install.
 Take the zip file from `zips` and install it to your Dispatcharr install.
