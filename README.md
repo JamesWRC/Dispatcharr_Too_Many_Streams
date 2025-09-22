@@ -3,7 +3,8 @@
 When the configured max stream limit is reached. Show a configurable display to users.
 
 If you want to show a useful screen / message to users when your stream limit is hit, then this is the plugin for you. 
-Rather than have the stream error or show a static image. This plugin will show what other currently in use channels are available to view when someone tries to view a new channel when your at your configured limit.
+Rather than have the stream error or show a static image. This plugin will show what other currently in use channels are available to view when someone tries to view a new channel when your at your configured limit. See the [example](#example)
+
 
 
 - [Features](#features)
@@ -13,6 +14,7 @@ Rather than have the stream error or show a static image. This plugin will show 
 - [Config](#config)
 - [Development](#development)
 - [Build](#build)
+- [Example](#example)
 
 # Features
 - Show a dynamic stream to users when the max stream limit is reached. This will show all currently active streams, that the user can view.
@@ -47,6 +49,10 @@ This plugin uses environment variables for config.
 | `TMS_PORT`         | `1337`    | TCP port for the internal HTTP server. Ensure the port is free or run a single instance per machine/process.  | `TMS_PORT=1337`                           |
 
 ## Development.
+Feel free to fork, raise a PR or request features via the [Discussions](https://github.com/JamesWRC/Dispatcharr_Too_Many_Streams/discussions)
+Im not a front end dev, so the HTML that gets rendered could <b>definitely</b> be improved.
+
+How to develop:
 - tested on windows WSL (Ubuntu)
 1. Run the `./setup_dev.sh`
 2. Restart VSCode.
@@ -55,3 +61,18 @@ This plugin uses environment variables for config.
 
 ## Build.
 To make a build, run: `./build.sh`
+
+
+# Example
+
+This example shows an example M3U account with a limit of 2 streams. With the third channel showing the 'TooManyStreams' stream, after all other streams fail.
+
+##### M3U account
+![m2u account profile](img/m3u.png)
+
+##### Example with 2 streams and one extra showing the TooManyStreams stream
+![Example with 2 streams and one extra showing the TooManyStreams stream](img/TooManyStreamsExample.png)
+---
+##### Too Many Streams
+This will show all other streams that are currently in use and available to watch
+![Larger image of what someone would see when there are Too Many Streams](img/TooManyStreamsExampleStream.png)
