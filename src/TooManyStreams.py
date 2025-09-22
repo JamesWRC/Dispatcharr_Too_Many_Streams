@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import asyncio
 import logging
 import os
 import time
@@ -10,232 +11,477 @@ import os, shutil, subprocess, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
 
-
-from apps.proxy.ts_proxy.stream_generator import StreamGenerator
+from apps.channels.models import Channel, ChannelStream, Stream
+from apps.proxy.ts_proxy.server import ProxyServer
+from apps.proxy.ts_proxy.services.channel_service import ChannelService
 from core.utils import RedisClient
 
-
-TMS_MAXED_TTL_SEC = 10
-TMS_MAXED_COUNTER = 2
-TMS_MAXED_PKL = "/dev/shm/TMS/mark_maxed.pkl"
-_tms_last_maxed = {}
-
-def _TMS_mark_maxed(channel_id) -> None:
-    channel_id = str(channel_id)
-    print(f"TooManyStreams: Marking channel {channel_id} as maxed")
-    # Set a short-lived flag that this channel recently hit maxed-out streams
-    _exp_time = time.time() + TMS_MAXED_TTL_SEC
-    if channel_id not in _tms_last_maxed:
-        _tms_last_maxed[channel_id] = {"exp_time": _exp_time, "failed_counter": 1}
-    else:
-        _tms_last_maxed[channel_id].update({"exp_time": _exp_time, "failed_counter": _tms_last_maxed[channel_id]["failed_counter"] + 1})
-    if not os.path.exists("/dev/shm/TMS"):
-        try:
-            os.makedirs("/dev/shm/TMS", exist_ok=True)
-        except Exception:
-            pass
-    pickle.dump(_tms_last_maxed, open("/dev/shm/TMS/mark_maxed.pkl", "wb"))
+from .TooManyStreamsConfig import TooManyStreamsConfig
+from .exceptions import TMS_CustomStreamNotFound
+from .ActiveStreamImgGen import ActiveStreamImgGen
 
 
-    print(f"TooManyStreams: Marked channel {channel_id} as maxed until {_tms_last_maxed[channel_id]}")
 
-def _TMS_is_maxed(channel_id) -> bool:
-    channel_id = str(channel_id)
-    # Check if this channel recently hit maxed-out streams
-    if os.path.exists(TMS_MAXED_PKL):
-        try:
-            global _tms_last_maxed
-            _tms_last_maxed = pickle.load(open(TMS_MAXED_PKL, "rb"))
-            print(f"TooManyStreams: Loaded maxed info from {TMS_MAXED_PKL}: {_tms_last_maxed}")
-        except Exception:
-            pass
 
-    if maxed := _tms_last_maxed.get(channel_id, None):
-        print(f"TooManyStreams: Channel {channel_id} maxed info: {maxed}")
-        _exp_time = maxed.get("exp_time", None)
-        _failed_counter = maxed.get("failed_counter", None)
 
-        if _exp_time is None or _failed_counter is None:
-            return False
+# def _ffmpeg_has(name: str) -> bool:
+#     try:
+#         from gevent import subprocess as gsubprocess; Subp = gsubprocess
+#     except Exception:
+#         import subprocess as gsubprocess; Subp = gsubprocess
+#     try:
+#         out = Subp.check_output(["ffmpeg","-hide_banner","-loglevel","error","-encoders"]).decode("utf-8","ignore")
+#     except Exception:
+#         return False
+#     return name in out
 
-        if _failed_counter < TMS_MAXED_COUNTER:
-            return False
-        
-        # if _exp_time < time.time():
-        #     _tms_last_maxed.pop(channel_id, None)
-        #     return False
-        
-        return True
-    else:
-        print(f"TooManyStreams: Channel {channel_id} has no maxed info")
-    return False
+# def still_ts_generator():
+#     import os, logging, time
+#     logger = logging.getLogger("plugins.too_many_streams")
 
-CHUNK = 188 * 7  # 1316 is fine; larger also OK
+#     CHUNK = 188 * 7  # good TS chunk size
+#     img_path = os.path.join(os.path.dirname(__file__), "no_streams3.jpg")
 
-def _ffmpeg_has(name: str) -> bool:
-    try:
-        from gevent import subprocess as gsubprocess; Subp = gsubprocess
-    except Exception:
-        import subprocess as gsubprocess; Subp = gsubprocess
-    try:
-        out = Subp.check_output(["ffmpeg","-hide_banner","-loglevel","error","-encoders"]).decode("utf-8","ignore")
-    except Exception:
-        return False
-    return name in out
+#     # gevent-friendly sleep & subprocess
+#     try:
+#         import gevent
+#         from gevent import subprocess as gsubprocess
+#         Subprocess = gsubprocess
+#         def _sleep(s): gevent.sleep(s)
+#     except Exception:
+#         import subprocess as gsubprocess
+#         Subprocess = gsubprocess
+#         def _sleep(s):
+#             import time
+#             time.sleep(s)
 
-def still_ts_generator():
-    import os, logging, time
-    logger = logging.getLogger("plugins.too_many_streams")
+#     def _ffmpeg_has(name: str) -> bool:
+#         try:
+#             out = Subprocess.check_output(
+#                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-encoders"]
+#             ).decode("utf-8", "ignore")
+#         except Exception:
+#             return False
+#         return name in out
 
-    CHUNK = 188 * 7  # good TS chunk size
-    img_path = os.path.join(os.path.dirname(__file__), "no_streams3.jpg")
+#     # Pick codecs (prefer h264/aac; fallback to mpeg2/mp2)
+#     h264 = _ffmpeg_has("libx264"); aac = _ffmpeg_has("aac")
+#     if h264 and aac:
+#         v_args = ["-c:v","libx264","-tune","stillimage","-pix_fmt","yuv420p",
+#                   "-profile:v","baseline","-level","3.0","-preset","veryfast",
+#                   "-r","25","-g","50","-keyint_min","50","-sc_threshold","0"]
+#         a_args = ["-c:a","aac","-b:a","96k","-ar","48000","-ac","2"]
+#         logger.info("TMS: using h264+aac for still stream")
+#     else:
+#         v_args = ["-c:v","mpeg2video","-q:v","2","-pix_fmt","yuv420p","-r","25","-g","50"]
+#         a_args = ["-c:a","mp2","-b:a","128k","-ar","48000","-ac","2"]
+#         logger.warning("TMS: falling back to mpeg2video+mp2 for still stream")
 
-    # gevent-friendly sleep & subprocess
-    try:
-        import gevent
-        from gevent import subprocess as gsubprocess
-        Subprocess = gsubprocess
-        def _sleep(s): gevent.sleep(s)
-    except Exception:
-        import subprocess as gsubprocess
-        Subprocess = gsubprocess
-        def _sleep(s):
-            import time
-            time.sleep(s)
+#     base_cmd = [
+#         "ffmpeg",
+#         "-hide_banner","-loglevel","error","-nostdin",
+#         "-re",
+#         "-stream_loop","-1","-i", img_path,               # loop the still forever
+#         "-f","lavfi","-i","anullsrc=r=48000:cl=stereo",   # silent audio
+#         *v_args, *a_args,
+#         "-vf","scale=3840:-2,format=yuv420p,setsar=1",
+#         "-f","mpegts",
+#         "-muxrate","3500000","-maxrate","3500000","-minrate","3500000","-bufsize","7000000",
+#         "-pat_period","0.1",
+#         "-mpegts_flags","+initial_discontinuity",
+#         "-flush_packets","1",
+#         "pipe:1",
+#     ]
 
-    def _ffmpeg_has(name: str) -> bool:
-        try:
-            out = Subprocess.check_output(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-encoders"]
-            ).decode("utf-8", "ignore")
-        except Exception:
-            return False
-        return name in out
+#     null_ts = b"\x47" + b"\x1f\xff" + b"\x10" + b"\x00"*185
 
-    # Pick codecs (prefer h264/aac; fallback to mpeg2/mp2)
-    h264 = _ffmpeg_has("libx264"); aac = _ffmpeg_has("aac")
-    if h264 and aac:
-        v_args = ["-c:v","libx264","-tune","stillimage","-pix_fmt","yuv420p",
-                  "-profile:v","baseline","-level","3.0","-preset","veryfast",
-                  "-r","25","-g","50","-keyint_min","50","-sc_threshold","0"]
-        a_args = ["-c:a","aac","-b:a","96k","-ar","48000","-ac","2"]
-        logger.info("TMS: using h264+aac for still stream")
-    else:
-        v_args = ["-c:v","mpeg2video","-q:v","2","-pix_fmt","yuv420p","-r","25","-g","50"]
-        a_args = ["-c:a","mp2","-b:a","128k","-ar","48000","-ac","2"]
-        logger.warning("TMS: falling back to mpeg2video+mp2 for still stream")
+#     def _stderr_pump(p):
+#         try:
+#             while True:
+#                 line = p.stderr.readline()
+#                 if not line:
+#                     break
+#                 logger.error("TMS ffmpeg: %s", line.decode("utf-8","ignore").rstrip())
+#         except Exception:
+#             pass
 
-    base_cmd = [
-        "ffmpeg",
-        "-hide_banner","-loglevel","error","-nostdin",
-        "-re",
-        "-stream_loop","-1","-i", img_path,               # loop the still forever
-        "-f","lavfi","-i","anullsrc=r=48000:cl=stereo",   # silent audio
-        *v_args, *a_args,
-        "-vf","scale=3840:-2,format=yuv420p,setsar=1",
-        "-f","mpegts",
-        "-muxrate","3500000","-maxrate","3500000","-minrate","3500000","-bufsize","7000000",
-        "-pat_period","0.1",
-        "-mpegts_flags","+initial_discontinuity",
-        "-flush_packets","1",
-        "pipe:1",
-    ]
+#     # Outer loop: restart ffmpeg if it ever exits (keeps stream looping forever)
+#     backoff = 0.25  # seconds, grows to avoid tight crash loops
+#     while True:
+#         if not os.path.exists(img_path):
+#             logger.error("TMS: image not found at %s; sending null TS keepalive", img_path)
+#             _sleep(0.5)
+#             yield null_ts
+#             continue
 
-    null_ts = b"\x47" + b"\x1f\xff" + b"\x10" + b"\x00"*185
+#         try:
+#             proc = Subprocess.Popen(
+#                 base_cmd, stdout=Subprocess.PIPE, stderr=Subprocess.PIPE, bufsize=0
+#             )
+#         except FileNotFoundError:
+#             logger.error("TMS: ffmpeg not found; sending null TS keepalive")
+#             _sleep(0.5)
+#             yield null_ts
+#             continue
 
-    def _stderr_pump(p):
-        try:
-            while True:
-                line = p.stderr.readline()
-                if not line:
-                    break
-                logger.error("TMS ffmpeg: %s", line.decode("utf-8","ignore").rstrip())
-        except Exception:
-            pass
+#         # Drain stderr (avoid deadlocks & get diagnostics)
+#         try:
+#             gevent.spawn(_stderr_pump, proc)  # if gevent present
+#         except Exception:
+#             import threading
+#             threading.Thread(target=_stderr_pump, args=(proc,), daemon=True).start()
 
-    # Outer loop: restart ffmpeg if it ever exits (keeps stream looping forever)
-    backoff = 0.25  # seconds, grows to avoid tight crash loops
-    while True:
-        if not os.path.exists(img_path):
-            logger.error("TMS: image not found at %s; sending null TS keepalive", img_path)
-            _sleep(0.5)
-            yield null_ts
-            continue
+#         try:
+#             # Inner streaming loop
+#             while True:
+#                 chunk = proc.stdout.read(CHUNK)
+#                 if not chunk:
+#                     rc = proc.poll()
+#                     logger.warning("TMS: ffmpeg ended (rc=%s); restarting in %.2fs", rc, backoff)
+#                     _sleep(backoff)
+#                     backoff = min(backoff * 2, 5.0)  # cap backoff
+#                     break  # break inner loop -> restart
+#                 else:
+#                     backoff = 0.25  # reset on healthy output
+#                     yield chunk
+#         except GeneratorExit:
+#             # client disconnected: stop ffmpeg and exit generator
+#             try:
+#                 proc.terminate(); proc.wait(timeout=1)
+#             except Exception:
+#                 try: proc.kill()
+#                 except Exception: pass
+#             return
+#         except Exception:
+#             logger.exception("TMS: generator error; restarting in %.2fs", backoff)
+#             _sleep(backoff)
+#             backoff = min(backoff * 2, 5.0)
+#         finally:
+#             try:
+#                 proc.terminate(); proc.wait(timeout=1)
+#             except Exception:
+#                 try: proc.kill()
+#                 except Exception: pass
 
-        try:
-            proc = Subprocess.Popen(
-                base_cmd, stdout=Subprocess.PIPE, stderr=Subprocess.PIPE, bufsize=0
-            )
-        except FileNotFoundError:
-            logger.error("TMS: ffmpeg not found; sending null TS keepalive")
-            _sleep(0.5)
-            yield null_ts
-            continue
-
-        # Drain stderr (avoid deadlocks & get diagnostics)
-        try:
-            gevent.spawn(_stderr_pump, proc)  # if gevent present
-        except Exception:
-            import threading
-            threading.Thread(target=_stderr_pump, args=(proc,), daemon=True).start()
-
-        try:
-            # Inner streaming loop
-            while True:
-                chunk = proc.stdout.read(CHUNK)
-                if not chunk:
-                    rc = proc.poll()
-                    logger.warning("TMS: ffmpeg ended (rc=%s); restarting in %.2fs", rc, backoff)
-                    _sleep(backoff)
-                    backoff = min(backoff * 2, 5.0)  # cap backoff
-                    break  # break inner loop -> restart
-                else:
-                    backoff = 0.25  # reset on healthy output
-                    yield chunk
-        except GeneratorExit:
-            # client disconnected: stop ffmpeg and exit generator
-            try:
-                proc.terminate(); proc.wait(timeout=1)
-            except Exception:
-                try: proc.kill()
-                except Exception: pass
-            return
-        except Exception:
-            logger.exception("TMS: generator error; restarting in %.2fs", backoff)
-            _sleep(backoff)
-            backoff = min(backoff * 2, 5.0)
-        finally:
-            try:
-                proc.terminate(); proc.wait(timeout=1)
-            except Exception:
-                try: proc.kill()
-                except Exception: pass
-
-logger = logging.getLogger('plugins.too_many_streams')
-logger.setLevel(logging.DEBUG)
+logger = logging.getLogger('plugins.too_many_streams.TooManyStreams')
+logger.setLevel(os.environ.get("TMS_LOG_LEVEL", os.environ.get("DISPATCHARR_LOG_LEVEL", "INFO")).upper())
 logger.info("TooManyStreams plugin initialized.")
+
 class TooManyStreams:
-    
 
-    def __init__(self):
-        # Create a logger for this plugin
-        self.logger = logger
+    STREAM_NAME = 'TooManyStreams'
+    # Timeout for how long to keep the "maxed out" flag (seconds)
+    TMS_MAXED_TTL_SEC = 30
+    # How many times a channel can hit maxed-out before we stop adding the TMS stream
+    TMS_MAXED_COUNTER = 1
+    # Path to store the "maxed out" flags (pickle file)
+    TMS_MAXED_PKL = "/dev/shm/TMS/mark_maxed.pkl"
+    # TS chunk size to read/send
+    CHUNK = 188 * 7  # 1316 is fine; larger also OK
+
+
+    @staticmethod
+    def check_requirements_met() -> bool:
+        """
+        Checks if the requirements for TooManyStreams are met.
+        Requirements:
+           - pip install -r requirements.txt
+        Returns:
+            bool: True if requirements are met, False otherwise.
+        """
+        try:
+           ActiveStreamImgGen()._find_wkhtmltoimage()
+           return True
+        except ImportError:
+            logger.error("TooManyStreams: Missing required packages.")
+            return False
+
+    @staticmethod
+    def install_requirements() -> None:
+        """
+        Installs the requirements for TooManyStreams via pip.
+        """
+        try:
+            import subprocess
+            subprocess.check_call(["pip", "install", "-r", os.path.join(os.path.dirname(__file__), "requirements.txt")])
+            logger.info("TooManyStreams: Successfully installed required packages.")
+            # Hold important deps like ffmpeg so the below wont break them
+            subprocess.check_call(["apt-get", "update"])
+            subprocess.check_call(["apt-get", "install", "-y", "wkhtmltopdf"])
+
+        except Exception as e:
+            logger.error(f"TooManyStreams: Failed to install required packages: {e}")
+
+    @staticmethod
+    def get_stream() -> Stream:
+        """
+        Finds and returns the custom TooManyStreams stream object.
+        Raises an exception if not found.
+        Returns:
+            Stream: The custom TooManyStreams stream object.
+        """
+        stream:dict = Stream.objects.values('id', 'name', 'url').filter(
+            name=TooManyStreams.STREAM_NAME, url=TooManyStreamsConfig.get_stream_url())
         
-        self.last_maxed = {}  # channel_id -> expires_at(float)
+        if not stream:
+            raise TMS_CustomStreamNotFound(f"TooManyStreams: No stream found with the criteria of:\
+                            - name={TooManyStreams.STREAM_NAME},\
+                            - url={TooManyStreamsConfig.get_stream_url()}")
+        
+        # Having multiple streams with same name/url is not ideal, but just use the first one
+        if len(stream) > 1:
+            logger.warning(f"TooManyStreams: Multiple streams found with the criteria of:\
+                            - name={TooManyStreams.STREAM_NAME},\
+                            - url={TooManyStreamsConfig.get_stream_url()}. Using the first one.")
+        
+        logger.debug(f"TooManyStreams: Fetching stream with : {stream[0]}")
+        custom_stream = Stream.objects.get(id=stream[0]['id'])
+        logger.debug(f"TooManyStreams: Found and using stream: {custom_stream}")
+        return custom_stream
+    
+    @staticmethod
+    def create_stream() -> Stream:
+        """
+        Creates the custom TooManyStreams stream if it does not already exist.
+        """
+        custom_stream = None
+        # Data required to create the custom stream
+        data = {
+            'name': TooManyStreams.STREAM_NAME,
+            'url': TooManyStreamsConfig.get_stream_url(),
+            'is_custom': True,
+            # Other data required for Stream creation. Defaults / nulls are used here.
+            'channel_group': None,
+            'stream_profile_id': None,
+        }
 
-        pass
-    def check_streams(self):
-        self.logger.info("Checking for too many streams.")
-        # Implement the logic to check for too many streams
-        pass
+        # Check if the stream already exists
+        try:
+            custom_stream = TooManyStreams.get_stream() 
+            logger.info(f"TooManyStreams: Custom stream already exists: {custom_stream}")
+            return custom_stream
+        except TMS_CustomStreamNotFound: # TooManyStreams.get_stream() raises this if not found
+            logger.info("TooManyStreams: Custom stream not found; creating it.")
+
+        # Create the custom stream
+        custom_stream = Stream.objects.create(**data) 
+        logger.info(f"TooManyStreams: Created custom stream: {custom_stream}")
+
+        return custom_stream
+
+    @staticmethod
+    def delete_stream() -> None:
+        """
+        Deletes the custom TooManyStreams stream if it exists.
+        """
+        try:
+            custom_stream = TooManyStreams.get_stream()
+            custom_stream.delete()
+            logger.info(f"TooManyStreams: Deleted custom stream: {custom_stream}")
+        except TMS_CustomStreamNotFound:
+            logger.info("TooManyStreams: Custom stream not found; nothing to delete.")
+
+    @staticmethod
+    def get_or_create_stream() -> Stream:
+        """
+        Gets the custom TooManyStreams stream, creating it if it does not exist.
+        """
+        try:
+            return TooManyStreams.get_stream()
+        except TMS_CustomStreamNotFound:
+            return TooManyStreams.create_stream()
+
+    @staticmethod
+    def add_stream_to_channel(channel_id:int) -> None:
+        """
+        Adds the custom TooManyStreams stream to the specified channel.
+        """
+        custom_stream = TooManyStreams.get_or_create_stream()
+        channel = None
+        try:
+            channel = Channel.objects.get(id=channel_id)
+        except Channel.DoesNotExist:
+            logger.error(f"TooManyStreams: Channel with ID {channel_id} does not exist.")
+            return
+
+        if not channel:
+            logger.error(f"TooManyStreams: Channel with ID {channel_id} could not be fetched.")
+            return
+
+        all_streams:list[Stream] = channel.streams.all().order_by("channelstream__order")
+        if custom_stream in all_streams:
+            logger.info(f"TooManyStreams: Stream already assigned to channel {channel_id}.")
+            return
+        
+        # channel.streams.add(custom_stream.id)
+        # Sort streams by ID to keep the custom stream at the end
+        # ids = [s.id for s in all_streams] + [custom_stream.id]
+        # channel.streams.set(ids, clear=True)
+        # channel.save()
+        ChannelStream.objects.create(
+                        channel=channel, stream_id=custom_stream.id, order=9999
+                    )
+        logger.info(f"TooManyStreams: Added stream {custom_stream.id} to channel {channel_id}.")
+
+    @staticmethod   
+    def remove_stream_from_channel(channel_id:int) -> None:
+        """
+        Removes the custom TooManyStreams stream from the specified channel.
+        """
+        custom_stream = TooManyStreams.get_or_create_stream()
+        channel = None
+        try:
+            channel = Channel.objects.get(id=channel_id)
+        except Channel.DoesNotExist:
+            logger.error(f"TooManyStreams: Channel with ID {channel_id} does not exist.")
+            return
+        
+        if not channel:
+            logger.error(f"TooManyStreams: Channel with ID {channel_id} could not be fetched.")
+            return
+
+        if custom_stream not in channel.streams.all():
+            logger.info(f"TooManyStreams: Stream not assigned to channel {channel_id}.")
+            return
+        
+        channel.streams.remove(custom_stream.id)
+        channel.save()
+
+        # Stopping channel 
+        # retry 3 times. # Below code is from Dispatcharr\apps\proxy\ts_proxy\views.py stop_channel()
+        for _ in range(5):
+            try:
+
+                result = ChannelService.stop_channel(str(channel.uuid))
+                if result.get("status") == "error":
+                    logger.warning(f"TooManyStreams: Failed to stop channel {channel_id}: {result.get('message')}")
+                    time.sleep(1)
+                    continue
+                else:
+                    logger.info(f"TooManyStreams: Stopped channel {channel_id} successfully.")
+            except Exception as e:
+                logger.error(f"TooManyStreams: Failed to stop stream for channel {channel_id}: {e}")
+                time.sleep(1)
+
+        proxy_server = ProxyServer.get_instance()
+        proxy_server.stop_channel(channel.uuid)
+        logger.debug(f"TooManyStreams: ProxyServer stopped channel {channel_id}.")
+        # manager = proxy_server.stream_managers.get(channel.uuid)
+        # logger.debug(f"TooManyStreams: ProxyServer manager for channel {channel_id}: {manager}")
+        # manager.stop()
+
+        logger.info(f"TooManyStreams: Removed stream {custom_stream.id} from channel {channel_id}.")
+
+    @staticmethod
+    def get_maxed_data() -> dict:
+        """
+        Loads and returns the dictionary of channels recently marked as maxed-out.
+        Returns:
+            dict: Dictionary of channel_id to maxed info.
+        """
+        _tms_last_maxed:dict = {}
+        if os.path.exists(TooManyStreams.TMS_MAXED_PKL):
+            try:
+                _tms_last_maxed = pickle.load(open(TooManyStreams.TMS_MAXED_PKL, "rb"))
+                logger.debug(f"TooManyStreams: Loaded maxed info: {TooManyStreams.TMS_MAXED_PKL}")
+            except Exception:
+                logger.warning(f"TooManyStreams: Failed to load maxed info from: {TooManyStreams.TMS_MAXED_PKL}. Returning empty dict.")
+                pass
+        return _tms_last_maxed
+
+    @staticmethod
+    def mark_streams_maxed(channel_id) -> None:
+        """
+        Marks the specified channel as having maxed-out streams. Adds a short-lived flag.
+        """
+        channel_id = str(channel_id)
+        logger.info(f"TooManyStreams: Marking channel {channel_id} as maxed")
+        # Set a short-lived flag that this channel recently hit maxed-out streams
+        _exp_time = time.time() + TooManyStreams.TMS_MAXED_TTL_SEC
+        _tms_last_maxed:dict = TooManyStreams.get_maxed_data()
+        if channel_id not in _tms_last_maxed:
+            _tms_last_maxed[channel_id] = {"exp_time": _exp_time, "failed_counter": 1}
+        else:
+            _tms_last_maxed[channel_id].update({"exp_time": _exp_time, "failed_counter": _tms_last_maxed[channel_id]["failed_counter"] + 1})
+        _pkl_path = os.path.dirname(TooManyStreams.TMS_MAXED_PKL)
+        if not os.path.exists(_pkl_path):
+            os.makedirs(_pkl_path, exist_ok=True)
+
+        pickle.dump(_tms_last_maxed, open(TooManyStreams.TMS_MAXED_PKL, "wb"))
 
 
-    def install_get_stream_override(self):
+        logger.debug(f"TooManyStreams: Marked channel {channel_id} as maxed until {_tms_last_maxed[channel_id]}")
+
+    @staticmethod
+    def is_streams_maxed(channel_id) -> bool:
+        """
+        Checks if the specified channel is currently marked as having maxed-out streams.
+        Adds the TooManyStreams stream to the channel if maxed, removes it if not.
+        Returns:
+            bool: True if the channel is marked as maxed, False otherwise.
+        """
+        is_maxed:bool = False
+        channel_id = str(channel_id)
+        _tms_last_maxed:dict = TooManyStreams.get_maxed_data()
+
+        if maxed := _tms_last_maxed.get(channel_id, None):
+
+            _exp_time = maxed.get("exp_time", None)
+            _failed_counter = maxed.get("failed_counter", None)
+
+            if _exp_time is None or _failed_counter is None:
+                logger.debug(f"TooManyStreams: Channel {channel_id},_exp_time: {_exp_time}, _failed_counter: {_failed_counter} invalid.")
+                is_maxed = False
+            elif _exp_time < time.time():
+                logger.info(f"TooManyStreams: Channel {channel_id} maxed flag expired at {_exp_time}; removing.")
+                _tms_last_maxed.pop(channel_id, None)
+                pickle.dump(_tms_last_maxed, open(TooManyStreams.TMS_MAXED_PKL, "wb"))
+                is_maxed = False
+            elif _failed_counter < TooManyStreams.TMS_MAXED_COUNTER:
+                logger.debug(f"TooManyStreams: Channel {channel_id} has only {_failed_counter} failed attempts; below threshold of {TooManyStreams.TMS_MAXED_COUNTER}. Not marking as maxed.")
+                is_maxed = False
+            else:
+                is_maxed = True
+            
+        else:
+            logger.info(f"TooManyStreams: Channel {channel_id} has no maxed info")
+            is_maxed = False
+        
+        if is_maxed:
+            logger.debug(f"TooManyStreams: Channel {channel_id} is currently marked as maxed")
+            TooManyStreams.add_stream_to_channel(channel_id)
+        else:
+            logger.debug(f"TooManyStreams: Channel {channel_id} is NOT marked as maxed")
+            TooManyStreams.remove_stream_from_channel(channel_id)
+
+        return is_maxed
+    
+    @staticmethod
+    def start_maxed_channel_cleanup_thread():
+        """
+        Periodically cleans up expired maxed-out flags from the pickle file.
+        """
+        logger.info("TooManyStreams: Starting maxed channel cleanup thread.")
+        def _cleanup_thread():
+            while True:
+                logger.debug("TooManyStreams: Cleanup thread running.")
+                _tms_last_maxed:dict = TooManyStreams.get_maxed_data()
+                logger.debug(f"TooManyStreams: Cleanup loaded maxed data: {_tms_last_maxed}")
+                for channel_id in list(_tms_last_maxed.keys()):
+                    TooManyStreams.is_streams_maxed(channel_id)  # This will remove expired entries
+                    logger.debug(f"TooManyStreams: Cleanup checked channel {channel_id}")
+                # !!WARNING: if the stream length is shorter then the cleanup interval, Dispatcharr can go into an infinite loop of reconnects / channel switches.
+                time.sleep(TooManyStreams.TMS_MAXED_TTL_SEC)
+        threading.Thread(target=_cleanup_thread, daemon=True).start()
+        logger.info("TooManyStreams: Started maxed channel cleanup thread.")
+
+
+    @staticmethod
+    def install_get_stream_override():
         # Import the class that owns get_stream (adjust import to your app)
         from apps.channels.models import Channel  # or whatever class defines get_stream
         
         if getattr(Channel, "_orig_get_stream", None) is None:
-            self.logger.info("--------------------------Installing get_stream override in Channel class.")
             Channel._orig_get_stream = Channel.get_stream  # save original
 
             def _wrapped_get_stream(self, *args, **kwargs):
@@ -279,6 +525,9 @@ class TooManyStreams:
 
                 # Iterate through channel streams and their profiles
                 for stream in self.streams.all().order_by("channelstream__order"):
+                    # ### TooManyStreams logic here ###
+                    # TooManyStreams.is_streams_maxed(self.id)
+                    # ### TooManyStreams END logic here ###
                     # Retrieve the M3U account associated with the stream.
                     m3u_account = stream.m3u_account
                     if not m3u_account:
@@ -339,16 +588,11 @@ class TooManyStreams:
                 # No available streams - determine specific reason
                 if has_streams_but_maxed_out:
                     #### TooManyStreams logic here ####
-                    id_is_maxed = _TMS_is_maxed(self.id)
-                    # uuid_is_maxed = _TMS_is_maxed(self.uuid)
-                    logger.info(f"TMS: Channel {self.id} maxed={id_is_maxed}")
-                    # logger.info(f"TMS: Channel {self.uuid} maxed={uuid_is_maxed}")
-                                
-                    if not id_is_maxed:
+                    if not TooManyStreams.is_streams_maxed(self.id):
                         error_reason = "All M3U profiles have reached maximum connection limits" 
-                        _TMS_mark_maxed(self.id)
-                        _TMS_mark_maxed(self.uuid)
+                        TooManyStreams.mark_streams_maxed(self.id)
                         return None, None, error_reason
+                    
                     return stream.id, profile.id, None
                     #### TooManyStreams END logic here ####
                 elif has_active_profiles:
@@ -360,124 +604,31 @@ class TooManyStreams:
 
             # Assigning a function to the class makes it a bound method automatically
             Channel.get_stream = _wrapped_get_stream
-        else:
-            self.logger.info("-------------------------get_stream override already installed, skipping.")
-
-
-
-
-    def install_stream_ts_return_override(self):
-        # 👉 Adjust this import to the module where stream_ts is defined
-        # e.g. from apps.proxy.ts_proxy import views as ts_views
-        from apps.proxy.ts_proxy import views as ts_views
-
-        if getattr(ts_views, "_orig_stream_ts", None) is None:
-            ts_views._orig_stream_ts = ts_views.stream_ts
-
-            def _patched_stream_ts(request, channel_id, *args, **kwargs):
-                resp = ts_views._orig_stream_ts(request, channel_id, *args, **kwargs)
-                print("TMS: stream_ts called, got response type %s", type(resp))
-                print("TMS: stream_ts called, got response status %s", getattr(resp, "status_code", "N/A")) 
-                print("TMS: stream_ts called, got response status %s", type(getattr(resp, "status_code", "N/A"))) 
-                print("TMS: stream_ts called, got response isinstance(resp, JsonResponse) %s", isinstance(resp, JsonResponse))
-                print("TMS: stream_ts called, got channel_id %s", channel_id)
-                stream_valid = _TMS_is_maxed(channel_id)
-                print(f"TMS: stream_ts called, is_maxed={stream_valid} for channel {channel_id}")
-                try:
-                    if isinstance(resp, StreamingHttpResponse) and stream_valid and False:
-                        # Build inputs for your generator
-                        print("TMS: substituting StreamingHttpResponse for channel=%s (was 503 JSON).", channel_id)
-                        client_ip = (request.META.get("HTTP_X_FORWARDED_FOR", "").split(",")[0].strip()
-                                    or request.META.get("REMOTE_ADDR"))
-                        client_user_agent = request.META.get("HTTP_USER_AGENT")
-                        client_id = getattr(request, "client_id", None) or f"tms-{int(time.time()*1000)}"
-                        channel_initializing = True  # good default since we’re substituting init wait
-
-                        generate = plugin_create_stream_generator(
-                            channel_id, client_id, client_ip, client_user_agent, channel_initializing
-                        )
-                        response = StreamingHttpResponse(
-                            streaming_content=generate(), content_type="video/mp2t"
-                        )
-                        response["Cache-Control"] = "no-cache"
-                        print(f"TMS: substituting StreamingHttpResponse or channel {channel_id}")
-                        print(f"TMS: substituting StreamingHttpResponse  for channel {channel_id}")
-                        return response
-
-
-                    else:
-                        return 
-                except Exception as e:
-                    print(f"TMS: failed to substitute streaming response; using original 503 JSON. {e}")
-
-                return resp
-
-            ts_views.stream_ts = _patched_stream_ts
-            print("TMS: installed stream_ts return override.")
-        else:
-            print("TMS: stream_ts override already installed; skipping.")
-
-
-    def install_generate_patch(self):
-        from apps.proxy.ts_proxy.stream_generator import StreamGenerator
-        print("TMS------: Patching StreamGenerator.generate method.")
-
-        if getattr(StreamGenerator, "_orig_generate", None) is None:
-            StreamGenerator._orig_generate = StreamGenerator.generate
-            print("TMS: Patching StreamGenerator.generate method.")
-            def _patched_generate(self, *args, **kwargs):
-                """
-                Generator function that produces the stream content for the client.
-                Handles initialization state, data delivery, and client disconnection.
-
-                Yields:
-                    bytes: Chunks of TS stream data
-                """
-                self.stream_start_time = time.time()
-                self.bytes_sent = 0
-                self.chunks_sent = 0
-
-                try:
-                    logger.info(f"[{self.client_id}] Stream generator started, channel_ready={not self.channel_initializing}")
-
-                    # First handle initialization if needed
-                    if self.channel_initializing:
-                        channel_ready = self._wait_for_initialization()
-                        if not channel_ready:
-                            # If initialization failed or timed out, we've already sent error packets
-                            return
-
-                    # Channel is now ready - start normal streaming
-                    logger.info(f"[{self.client_id}] Channel {self.channel_id} ready, starting normal streaming")
-
-                    # Reset start time for real streaming
-                    self.stream_start_time = time.time()
-
-                    # Setup streaming parameters and verify resources
-                    if not self._setup_streaming():
-                        return
-
-                    # Main streaming loop
-                    for chunk in still_ts_generator() if _TMS_is_maxed(self.channel_id) else self._stream_data_generator():
-                        yield chunk
-
-                except Exception as e:
-                    logger.error(f"[{self.client_id}] Stream error: {e}", exc_info=True)
-                finally:
-                    self._cleanup()
-            
-            StreamGenerator.generate = _patched_generate
-                
-            print("TMS: installed stream_ts return override.")
-
-            # return StreamGenerator._orig_generate
-        else:
-            print("TMS: stream_ts override already installed; skipping.")
 
     @staticmethod
-    def stream_still_mpegts_http(
-        image_path: str,
-        on_client_start: Optional[Callable[[], Optional[str]]] = None,
+    def apply_to_all_channels():
+        """
+        Applies the TooManyStreams logic to all channels in the database.
+        """
+        channels = Channel.objects.all()
+        for channel in channels:
+            TooManyStreams.add_stream_to_channel(channel.id)
+            logger.info(f"TooManyStreams: Applied to channel {channel.id}")
+
+    @staticmethod
+    def remove_from_all_channels():
+        """
+        Removes the TooManyStreams stream from all channels in the database.
+        """
+        channels = Channel.objects.all()
+        for channel in channels:
+            TooManyStreams.remove_stream_from_channel(channel.id)
+            logger.info(f"TooManyStreams: Removed from channel {channel.id}")
+
+
+    @staticmethod
+    def stream_still_mpegts_http_thread(
+        image_path: str|None = None,
         host: str = "127.0.0.1",
         port: int = 8081,
     ) -> None:
@@ -490,25 +641,24 @@ class TooManyStreams:
         Open in VLC: Media -> Open Network Stream -> http://<host>:<port>/stream.ts
         (Default: http://127.0.0.1:8081/stream.ts)
         """
-        print("TooManyStreams: Starting still image HTTP server on http://%s:%d/stream.ts", host, port)
+
         def ffmpeg_or_die():
             exe = shutil.which("ffmpeg")
             if not exe:
                 sys.exit("ERROR: ffmpeg not found in PATH. Install ffmpeg and try again.")
             return exe
 
-        if not os.path.exists(image_path):
-            sys.exit(f"ERROR: Image not found: {image_path}")
+        if image_path and not os.path.exists(image_path):
+            logger.error(f"TooManyStreams: Image path {image_path} does not exist.")
 
         ffmpeg_bin = ffmpeg_or_die()
 
         # Encoding defaults tuned for compatibility + quick startup for a still image
-        fps = 25
-        width = 1280
-        v_bitrate = "3500k"
-        a_bitrate = "128k"
-        muxrate   = "3500k"
-        bufsize   = "7000k"
+        fps = 1               # 1 fps. Is still image
+        v_bitrate = "800k"
+        a_bitrate = "96k"
+        muxrate   = "900k"
+        bufsize   = "1600k"
 
         # Pre-detect encoders once (best-effort)
         def encoder_available(name: str) -> bool:
@@ -518,43 +668,28 @@ class TooManyStreams:
             except Exception:
                 return False
 
-        use_h264 = encoder_available("libx264")
         use_aac  = encoder_available("aac")
 
         # Build the command for a given image
-        def make_ffmpeg_cmd(img: str):
+        def make_ffmpeg_cmd(img: str, stream_ts:str):
+
+            # !!WARNING: if the stream length is shorter then the cleanup interval, Dispatcharr can go into an infinite loop of reconnects / channel switches.
+            stream_length_secs = TooManyStreams.TMS_MAXED_TTL_SEC * 2
             in_args = [
-                "-loop", "1", "-framerate", str(fps), "-i", img,
-                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                "-loop","1","-framerate",str(fps),"-i",img,
+                "-f","lavfi","-i","anullsrc=r=48000:cl=stereo",
+                "-c:v","libx264","-preset","ultrafast","-tune","stillimage","-r",str(fps),"-g",str(fps),"-keyint_min",str(fps),
+                "-b:v",v_bitrate,"-maxrate",v_bitrate,"-minrate",v_bitrate,"-bufsize",bufsize,
+                "-c:a","aac" if use_aac else "mp2","-b:a",a_bitrate,
+                "-muxrate",muxrate,"-fflags","+genpts", "-mpegts_flags", "+resend_headers+initial_discontinuity", "-t", f"{stream_length_secs}", "-f","mpegts", stream_ts
             ]
-            map_args = ["-map", "0:v:0", "-map", "1:a:0"]
-            v_args = [
-                "-c:v", "libx264" if use_h264 else "mpeg2video",
-                "-tune", "stillimage" if use_h264 else "film",
-                "-pix_fmt", "yuv420p",
-                "-profile:v", "baseline" if use_h264 else "main",
-                "-level", "3.1" if use_h264 else "2.0",
-                "-g", str(fps * 2), "-keyint_min", str(fps * 2),
-                "-r", str(fps),
-                "-vf", f"scale={width}:-2,format=yuv420p,setsar=1",
-                "-b:v", v_bitrate, "-maxrate", v_bitrate, "-minrate", v_bitrate,
-                "-bufsize", bufsize,
-            ]
-            a_args = (["-c:a", "aac", "-b:a", a_bitrate] if use_aac else ["-c:a", "mp2", "-b:a", "192k"]) + [
-                "-ar", "48000", "-ac", "2"
-            ]
-            ts_args = [
-                "-muxrate", muxrate,
-                "-pat_period", "0.1",
-                "-mpegts_flags", "+initial_discontinuity",
-                "-flush_packets", "1",
-            ]
-            # Output: write MPEG-TS to stdout
-            out_args = ["-f", "mpegts", "pipe:1"]
-            return [ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                    *in_args, *map_args, *v_args, *a_args, *ts_args, *out_args]
+
+            # Return the full command
+            return [ffmpeg_bin, *in_args]
+
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
             def do_GET(self):
                 if self.path not in ("/", "/stream.ts"):
                     self.send_response(404)
@@ -562,88 +697,84 @@ class TooManyStreams:
                     self.wfile.write(b"Not found")
                     return
 
-                # Pick image for THIS client
-                chosen_img = None
-                if on_client_start:
-                    try:
-                        chosen_img = on_client_start()
-                    except Exception as e:
-                        # Don't crash the server if the callback fails
-                        print(f"[on_client_start] error: {e}", file=sys.stderr)
-                if not chosen_img:
-                    chosen_img = image_path
 
-                if not os.path.exists(chosen_img):
-                    self.send_response(404)
-                    self.end_headers()
-                    self.wfile.write(b"Image not found")
-                    return
-
-                # Start ffmpeg for this client
-                cmd = make_ffmpeg_cmd(chosen_img)
-                print(f"[HTTP] Client {self.client_address} starting stream from: {chosen_img}")
                 # Send headers first so VLC starts reading
                 self.send_response(200)
-                self.send_header("Content-Type", "video/MP2T")
+                self.send_header("Content-Type", "video/mp2t")
                 self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
                 self.send_header("Pragma", "no-cache")
-                self.send_header("Connection", "close")
+                # keep-alive fine; the stream is indefinite
+                self.send_header("Connection", "keep-alive")
                 self.end_headers()
+                # Start ffmpeg for this client
+                stream_ts = os.path.join(os.path.dirname(__file__), "no_streams.ts")
+                if os.path.exists(stream_ts):
+                    os.remove(stream_ts)
 
+                chosen_img = image_path
+                # Generate the image from 
+                if not image_path or not os.path.exists(image_path):
+                    chosen_img = os.path.join(os.path.dirname(__file__), "too_many_streams2.jpg")
+                
+                    try:
+                        asig = ActiveStreamImgGen(out_path=chosen_img)
+                        asig.get_active_streams()
+                        asig.generate()
+                    except Exception as e:
+                        logger.error(f"TMS ERROR: [HTTP] Client {self.client_address} image generation error: {e}", file=sys.stderr)
+                        self.send_response(500)
+                        self.end_headers()
+                        self.wfile.write(b"Failed to generate image")
+                        return
+
+
+                cmd = make_ffmpeg_cmd(chosen_img, stream_ts)
+                logger.debug(f"Running ffmpeg command: {' '.join(cmd)}")
+                # # Generate the stream
+                gen_ts = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                gen_ts.wait()  # wait for process to complete
+                if gen_ts.returncode != 0:
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Failed to generate stream")
+                    return
+                else:
+                    gen_ts.terminate()
+                if not os.path.exists(stream_ts):
+                    self.send_response(500)
+                    self.end_headers()
+                    self.wfile.write(b"Failed to generate stream")
+                    return
                 try:
-                    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
-                        # Pump ffmpeg stdout to client until they disconnect
+                    with open(stream_ts, 'rb') as f:
                         while True:
-                            chunk = proc.stdout.read(1316)  # TS packet multiple
-                            if not chunk:
+                            CHUNK = 1316 * 32  # bigger writes help downstream
+                            buf = f.read(CHUNK)
+                            if not buf:
                                 break
                             try:
-                                self.wfile.write(chunk)
+                                self.wfile.write(buf)
+                                self.wfile.flush()
                             except (BrokenPipeError, ConnectionResetError):
                                 break
-                finally:
-                    # Ensure the ffmpeg process is gone
-                    try:
-                        if proc and proc.poll() is None:
-                            proc.terminate()
-                            try:
-                                proc.wait(timeout=2)
-                            except subprocess.TimeoutExpired:
-                                proc.kill()
-                    except Exception:
-                        pass
+                except Exception as e:
+                    logger.error(f"TMS ERROR: [HTTP] Client {self.client_address} stream error: {e}", file=sys.stderr)
+                logger.debug(f"TMS ERROR: [HTTP] Client {self.client_address} disconnected")
 
             def log_message(self, fmt, *args):
                 # Quieter server logs
                 return
 
         httpd = ThreadingHTTPServer((host, port), Handler)
-        print(f"HTTP MPEG-TS server listening on http://{host}:{port}/stream.ts")
-        print("Open in VLC: Media -> Open Network Stream -> http://127.0.0.1:8081/stream.ts")
-        print("Press Ctrl+C to stop.\n")
+        logger.info(f"HTTP MPEG-TS server listening on http://{host}:{port}/stream.ts")
 
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\nStopping server…")
+            logger.info("\nStopping server…")
             # shutdown() from a non-main thread is safe; here we're in main.
             httpd.shutdown()
             httpd.server_close()
 
-    def TMS_generate_stream_url(self):
-        from apps.proxy.ts_proxy import url_utils
-        if getattr(url_utils, "_orig_generate_stream_url", None) is None:
-            url_utils._orig_generate_stream_url = url_utils.generate_stream_url
 
-            def _patched_generate_stream_url(channel_id:str):
-                stream_url, stream_user_agent, transcode, profile_value = ( url_utils._orig_generate_stream_url(channel_id) )
-                print(f"TMS: generate_stream_url called for channel {channel_id}, is_maxed={_TMS_is_maxed(channel_id)}")
-                if _TMS_is_maxed(channel_id):
-                    print(f"TMS: generate_stream_url substituting still image URL for channel {channel_id}")
-                    stream_url = "http://127.0.0.1:8081/stream.ts"
-
-                return stream_url, stream_user_agent, transcode, profile_value
-            
-            url_utils.generate_stream_url = _patched_generate_stream_url
-        else:
-            print("TMS: generate_stream_url override already installed; skipping.")
+        

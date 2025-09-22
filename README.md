@@ -14,3 +14,13 @@ Take the zip file from `zips` and install it to your Dispatcharr install.
 
 ## Build.
 To make a build, run: `./build.sh`
+
+
+subprocess.check_call(["apt-get", "update"])
+subprocess.check_call(["apt-get", "install", "-y", "wkhtmltopdf"])
+
+
+TMS_LOG_LEVEL
+TMS_IMAGE_PATH
+TMS_HOST
+TMS_PORT

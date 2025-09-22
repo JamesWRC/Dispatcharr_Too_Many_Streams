@@ -38,7 +38,7 @@ python -m pip install --upgrade pip wheel >/dev/null
 # 4) Install requirements if present (idempotent)
 if [ -f "requirements.txt" ]; then
   echo "[setup] Installing requirements ..."
-  pip install -r requirements.txt
+  pip install -r ./src/requirements.txt
 fi
 
 # 5) Export environment from .env if present (POSIX-friendly)
