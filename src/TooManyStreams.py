@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import asyncio
 import logging
 import os
 import time
-import gevent
-from django.http import StreamingHttpResponse, JsonResponse, HttpResponseRedirect
 import pickle
 import os, shutil, subprocess, sys, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, Optional
 
 from apps.channels.models import Channel, ChannelStream, Stream
 from apps.proxy.ts_proxy.server import ProxyServer
@@ -20,148 +16,6 @@ from .TooManyStreamsConfig import TooManyStreamsConfig
 from .exceptions import TMS_CustomStreamNotFound
 from .ActiveStreamImgGen import ActiveStreamImgGen
 
-
-
-
-
-# def _ffmpeg_has(name: str) -> bool:
-#     try:
-#         from gevent import subprocess as gsubprocess; Subp = gsubprocess
-#     except Exception:
-#         import subprocess as gsubprocess; Subp = gsubprocess
-#     try:
-#         out = Subp.check_output(["ffmpeg","-hide_banner","-loglevel","error","-encoders"]).decode("utf-8","ignore")
-#     except Exception:
-#         return False
-#     return name in out
-
-# def still_ts_generator():
-#     import os, logging, time
-#     logger = logging.getLogger("plugins.too_many_streams")
-
-#     CHUNK = 188 * 7  # good TS chunk size
-#     img_path = os.path.join(os.path.dirname(__file__), "no_streams3.jpg")
-
-#     # gevent-friendly sleep & subprocess
-#     try:
-#         import gevent
-#         from gevent import subprocess as gsubprocess
-#         Subprocess = gsubprocess
-#         def _sleep(s): gevent.sleep(s)
-#     except Exception:
-#         import subprocess as gsubprocess
-#         Subprocess = gsubprocess
-#         def _sleep(s):
-#             import time
-#             time.sleep(s)
-
-#     def _ffmpeg_has(name: str) -> bool:
-#         try:
-#             out = Subprocess.check_output(
-#                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-encoders"]
-#             ).decode("utf-8", "ignore")
-#         except Exception:
-#             return False
-#         return name in out
-
-#     # Pick codecs (prefer h264/aac; fallback to mpeg2/mp2)
-#     h264 = _ffmpeg_has("libx264"); aac = _ffmpeg_has("aac")
-#     if h264 and aac:
-#         v_args = ["-c:v","libx264","-tune","stillimage","-pix_fmt","yuv420p",
-#                   "-profile:v","baseline","-level","3.0","-preset","veryfast",
-#                   "-r","25","-g","50","-keyint_min","50","-sc_threshold","0"]
-#         a_args = ["-c:a","aac","-b:a","96k","-ar","48000","-ac","2"]
-#         logger.info("TMS: using h264+aac for still stream")
-#     else:
-#         v_args = ["-c:v","mpeg2video","-q:v","2","-pix_fmt","yuv420p","-r","25","-g","50"]
-#         a_args = ["-c:a","mp2","-b:a","128k","-ar","48000","-ac","2"]
-#         logger.warning("TMS: falling back to mpeg2video+mp2 for still stream")
-
-#     base_cmd = [
-#         "ffmpeg",
-#         "-hide_banner","-loglevel","error","-nostdin",
-#         "-re",
-#         "-stream_loop","-1","-i", img_path,               # loop the still forever
-#         "-f","lavfi","-i","anullsrc=r=48000:cl=stereo",   # silent audio
-#         *v_args, *a_args,
-#         "-vf","scale=3840:-2,format=yuv420p,setsar=1",
-#         "-f","mpegts",
-#         "-muxrate","3500000","-maxrate","3500000","-minrate","3500000","-bufsize","7000000",
-#         "-pat_period","0.1",
-#         "-mpegts_flags","+initial_discontinuity",
-#         "-flush_packets","1",
-#         "pipe:1",
-#     ]
-
-#     null_ts = b"\x47" + b"\x1f\xff" + b"\x10" + b"\x00"*185
-
-#     def _stderr_pump(p):
-#         try:
-#             while True:
-#                 line = p.stderr.readline()
-#                 if not line:
-#                     break
-#                 logger.error("TMS ffmpeg: %s", line.decode("utf-8","ignore").rstrip())
-#         except Exception:
-#             pass
-
-#     # Outer loop: restart ffmpeg if it ever exits (keeps stream looping forever)
-#     backoff = 0.25  # seconds, grows to avoid tight crash loops
-#     while True:
-#         if not os.path.exists(img_path):
-#             logger.error("TMS: image not found at %s; sending null TS keepalive", img_path)
-#             _sleep(0.5)
-#             yield null_ts
-#             continue
-
-#         try:
-#             proc = Subprocess.Popen(
-#                 base_cmd, stdout=Subprocess.PIPE, stderr=Subprocess.PIPE, bufsize=0
-#             )
-#         except FileNotFoundError:
-#             logger.error("TMS: ffmpeg not found; sending null TS keepalive")
-#             _sleep(0.5)
-#             yield null_ts
-#             continue
-
-#         # Drain stderr (avoid deadlocks & get diagnostics)
-#         try:
-#             gevent.spawn(_stderr_pump, proc)  # if gevent present
-#         except Exception:
-#             import threading
-#             threading.Thread(target=_stderr_pump, args=(proc,), daemon=True).start()
-
-#         try:
-#             # Inner streaming loop
-#             while True:
-#                 chunk = proc.stdout.read(CHUNK)
-#                 if not chunk:
-#                     rc = proc.poll()
-#                     logger.warning("TMS: ffmpeg ended (rc=%s); restarting in %.2fs", rc, backoff)
-#                     _sleep(backoff)
-#                     backoff = min(backoff * 2, 5.0)  # cap backoff
-#                     break  # break inner loop -> restart
-#                 else:
-#                     backoff = 0.25  # reset on healthy output
-#                     yield chunk
-#         except GeneratorExit:
-#             # client disconnected: stop ffmpeg and exit generator
-#             try:
-#                 proc.terminate(); proc.wait(timeout=1)
-#             except Exception:
-#                 try: proc.kill()
-#                 except Exception: pass
-#             return
-#         except Exception:
-#             logger.exception("TMS: generator error; restarting in %.2fs", backoff)
-#             _sleep(backoff)
-#             backoff = min(backoff * 2, 5.0)
-#         finally:
-#             try:
-#                 proc.terminate(); proc.wait(timeout=1)
-#             except Exception:
-#                 try: proc.kill()
-#                 except Exception: pass
 
 logger = logging.getLogger('plugins.too_many_streams.TooManyStreams')
 logger.setLevel(os.environ.get("TMS_LOG_LEVEL", os.environ.get("DISPATCHARR_LOG_LEVEL", "INFO")).upper())
@@ -312,12 +166,7 @@ class TooManyStreams:
         if custom_stream in all_streams:
             logger.info(f"TooManyStreams: Stream already assigned to channel {channel_id}.")
             return
-        
-        # channel.streams.add(custom_stream.id)
-        # Sort streams by ID to keep the custom stream at the end
-        # ids = [s.id for s in all_streams] + [custom_stream.id]
-        # channel.streams.set(ids, clear=True)
-        # channel.save()
+
         ChannelStream.objects.create(
                         channel=channel, stream_id=custom_stream.id, order=9999
                     )
@@ -368,11 +217,6 @@ class TooManyStreams:
                 logger.error(f"TooManyStreams: Failed to stop stream for channel {channel_id}: {e}")
                 time.sleep(1)
 
-        
-
-        # manager = proxy_server.stream_managers.get(channel.uuid)
-        # logger.debug(f"TooManyStreams: ProxyServer manager for channel {channel_id}: {manager}")
-        # manager.stop()
 
         logger.info(f"TooManyStreams: Removed stream {custom_stream.id} from channel {channel_id}.")
 
@@ -482,8 +326,8 @@ class TooManyStreams:
 
     @staticmethod
     def install_get_stream_override():
-        # Import the class that owns get_stream (adjust import to your app)
-        from apps.channels.models import Channel  # or whatever class defines get_stream
+        # Import the class that owns get_stream
+        from apps.channels.models import Channel 
         
         if getattr(Channel, "_orig_get_stream", None) is None:
             Channel._orig_get_stream = Channel.get_stream  # save original
@@ -776,7 +620,6 @@ class TooManyStreams:
             httpd.serve_forever()
         except KeyboardInterrupt:
             logger.info("\nStopping server…")
-            # shutdown() from a non-main thread is safe; here we're in main.
             httpd.shutdown()
             httpd.server_close()
 

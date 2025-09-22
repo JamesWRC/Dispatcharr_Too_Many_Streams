@@ -24,3 +24,6 @@ TMS_LOG_LEVEL
 TMS_IMAGE_PATH
 TMS_HOST
 TMS_PORT
+
+from apps.channels.models import Channel 
+overrides the Channel.get_stream function
