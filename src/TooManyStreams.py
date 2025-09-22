@@ -349,13 +349,18 @@ class TooManyStreams:
 
         # Stopping channel 
         # retry 3 times. # Below code is from Dispatcharr\apps\proxy\ts_proxy\views.py stop_channel()
+        proxy_server = ProxyServer.get_instance()
         for _ in range(5):
             try:
 
                 result = ChannelService.stop_channel(str(channel.uuid))
+                proxy_server.stop_channel(channel.uuid)
+                
+                logger.debug(f"TooManyStreams: ProxyServer stopped channel {channel_id}.")
+                time.sleep(1)
+
                 if result.get("status") == "error":
                     logger.warning(f"TooManyStreams: Failed to stop channel {channel_id}: {result.get('message')}")
-                    time.sleep(1)
                     continue
                 else:
                     logger.info(f"TooManyStreams: Stopped channel {channel_id} successfully.")
@@ -363,9 +368,8 @@ class TooManyStreams:
                 logger.error(f"TooManyStreams: Failed to stop stream for channel {channel_id}: {e}")
                 time.sleep(1)
 
-        proxy_server = ProxyServer.get_instance()
-        proxy_server.stop_channel(channel.uuid)
-        logger.debug(f"TooManyStreams: ProxyServer stopped channel {channel_id}.")
+        
+
         # manager = proxy_server.stream_managers.get(channel.uuid)
         # logger.debug(f"TooManyStreams: ProxyServer manager for channel {channel_id}: {manager}")
         # manager.stop()
