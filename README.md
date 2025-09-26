@@ -39,6 +39,12 @@ As always, install at your own risk. This could break your install
 > Anytime you install / uninstall. You must restart, else this plugin wont work.
 
 # Config
+
+
+### UI settings
+In the Plugin page, you can now customize the Title, Description, column limit, and CSS. Restart is required after each change.
+
+### Environment variables
 This plugin uses environment variables for config.
 
 | Variable           | Default   | Description                                                                                                   | Example                                   |
