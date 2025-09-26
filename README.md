@@ -43,6 +43,7 @@ As always, install at your own risk. This could break your install
 
 ### UI settings
 In the Plugin page, you can now customize the Title, Description, column limit, and CSS. Restart is required after each change.
+You can persist your config, by running the 'Save Plugin Config' action. This creates a json file in `/data/plugins/persistent_config/`. Mount this folder in your docker config too.
 
 ### Environment variables
 This plugin uses environment variables for config.
