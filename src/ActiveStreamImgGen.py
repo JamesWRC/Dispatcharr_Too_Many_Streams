@@ -7,7 +7,13 @@ from apps.channels.models import Channel
 from apps.proxy.ts_proxy.server import ProxyServer
 from apps.proxy.ts_proxy.channel_status import ChannelStatus
 
-from .TooManyStreamsConfig import TooManyStreamsConfig
+from .TooManyStreamsConfig import DEFAULT_CSS, TooManyStreamsConfig
+
+
+DEFAULT_TITLE = "Sorry, this channel is unavailable."
+DEFAULT_DESCRIPTION = "While this channel is not currently available, here are some other channels you can watch."
+DEFAULT_HTML_COLS = 4
+DEFAULT_OUT_FILE = "too_many_streams.jpg"
 
 class ActiveStreamImgGen:
     """
@@ -15,17 +21,12 @@ class ActiveStreamImgGen:
     No Playwright/Chromium required.
     """
 
-    DEFAULT_TITLE = "Sorry, this channel is unavailable."
-    DEFAULT_DESCRIPTION = "While this channel is not currently available, here are some other channels you can watch."
-    DEFAULT_HTML_COLS = 4
-    DEFAULT_OUT_FILE = "too_many_streams.jpg"
-
     def __init__(
         self,
-        title: str = DEFAULT_TITLE,
-        description: str = DEFAULT_DESCRIPTION,
+        title: str = TooManyStreamsConfig.get_plugin_config("stream_title") or DEFAULT_TITLE,
+        description: str = TooManyStreamsConfig.get_plugin_config("stream_description") or DEFAULT_DESCRIPTION,
         out_path: str = DEFAULT_OUT_FILE,
-        html_cols: int = DEFAULT_HTML_COLS,
+        html_cols: int = TooManyStreamsConfig.get_plugin_config("stream_channel_cols") or DEFAULT_HTML_COLS,
     ):
         self.title = title
         self.description = description
@@ -114,119 +115,125 @@ class ActiveStreamImgGen:
         rows_count = len(self.active_streams)
       
         REPLACE_WITH_PERCENT = round(100 / self.html_cols, 3)
-        style = f"""
-        <style>
-          html, body {{
-            width: 1920px; height: 1080px; margin: 0; background: #fff; color: #111;
-            font-family: Arial, "Segoe UI", Roboto, sans-serif; /* simple stack */
-          }}
+        # style = f"""
+        # <style>
+        #   html, body {{
+        #     width: 1920px; height: 1080px; margin: 0; background: #fff; color: #111;
+        #     font-family: Arial, "Segoe UI", Roboto, sans-serif; /* simple stack */
+        #   }}
 
-          /* Center whole block */
-          body {{
-            text-align: center; /* minimal, avoids flex */
-          }}
-          .wrap {{
-            width: 92%;
-            max-width: 1680px;
-            margin: 0 auto;
-            display: block;
-          }}
+        #   /* Center whole block */
+        #   body {{
+        #     text-align: center; /* minimal, avoids flex */
+        #   }}
+        #   .wrap {{
+        #     width: 92%;
+        #     max-width: 1680px;
+        #     margin: 0 auto;
+        #     display: block;
+        #   }}
 
-          h1 {{
-            font-size: 48px;  /* fixed size; avoid clamp() */
-            margin: 0 0 12px;
-          }}
-          .desc {{
-            width: 82%;
-            margin: 0 auto 20px;
-            font-size: 20px;    /* fixed */
-            line-height: 1.45;
-            color: #333;
-          }}
+        #   h1 {{
+        #     font-size: 48px;  /* fixed size; avoid clamp() */
+        #     margin: 0 0 12px;
+        #   }}
+        #   .desc {{
+        #     width: 82%;
+        #     margin: 0 auto 20px;
+        #     font-size: 20px;    /* fixed */
+        #     line-height: 1.45;
+        #     color: #333;
+        #   }}
 
-          /* ------- Grid replacement (row/column without CSS Grid) ------- */
-          /* Set columns in your template (C = self.html_cols) */
-          /* Each card becomes an inline-block with percentage width */
-          .grid {{ font-size: 0; /* remove gaps between inline-blocks */ }}
-          .card {{
-            display: inline-block;
-            vertical-align: top;
-            width: {REPLACE_WITH_PERCENT}%;  /* = 100 / C, e.g., 50% for 2 cols, 33.333% for 3 */
-            box-sizing: border-box;
-            padding: 16px 22px;
-            margin: 7px 9px;               /* simulate gap */
-            background: #ffffff;
-            border: 1px solid #e6e9ef;
-            border-radius: 16px;
-            box-shadow: 0 1px 2px rgba(16,24,40,0.04);
-            font-size: 16px; /* restore text size */
-            text-align: left;
-          }}
+        #   /* ------- Grid replacement (row/column without CSS Grid) ------- */
+        #   /* Set columns in your template (C = self.html_cols) */
+        #   /* Each card becomes an inline-block with percentage width */
+        #   .grid {{ font-size: 0; /* remove gaps between inline-blocks */ }}
+        #   .card {{
+        #     display: inline-block;
+        #     vertical-align: top;
+        #     width: {REPLACE_WITH_PERCENT}%;  /* = 100 / C, e.g., 50% for 2 cols, 33.333% for 3 */
+        #     box-sizing: border-box;
+        #     padding: 16px 22px;
+        #     margin: 7px 9px;               /* simulate gap */
+        #     background: #ffffff;
+        #     border: 1px solid #e6e9ef;
+        #     border-radius: 16px;
+        #     box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+        #     font-size: 16px; /* restore text size */
+        #     text-align: left;
+        #   }}
 
-          /* darker stripe for “even” rows: add class server-side */
-          .card_even {{
-            display: inline-block;
-            vertical-align: top;
-            width: {REPLACE_WITH_PERCENT}%;  /* = 100 / C, e.g., 50% for 2 cols, 33.333% for 3 */
-            box-sizing: border-box;
-            padding: 16px 22px;
-            margin: 7px 9px;               /* simulate gap */
-            background: #e2e2e2;
-            border: 1px solid #e6e9ef;
-            border-radius: 16px;
-            box-shadow: 0 1px 2px rgba(16,24,40,0.04);
-            font-size: 16px; /* restore text size */
-            text-align: left;
-          }}
+        #   /* darker stripe for “even” rows: add class server-side */
+        #   .card_even {{
+        #     display: inline-block;
+        #     vertical-align: top;
+        #     width: {REPLACE_WITH_PERCENT}%;  /* = 100 / C, e.g., 50% for 2 cols, 33.333% for 3 */
+        #     box-sizing: border-box;
+        #     padding: 16px 22px;
+        #     margin: 7px 9px;               /* simulate gap */
+        #     background: #e2e2e2;
+        #     border: 1px solid #e6e9ef;
+        #     border-radius: 16px;
+        #     box-shadow: 0 1px 2px rgba(16,24,40,0.04);
+        #     font-size: 16px; /* restore text size */
+        #     text-align: left;
+        #   }}
 
-          /* channel number pill */
-          .chan {{
-            display: inline-block;
-            font-weight: 600;
-            font-size: 18px;
-            padding: 6px 10px;
-            border-radius: 999px;
-            background: #e1e1e1;
-            color: #7294f2;
-            border: 1px solid #dbe5ff;
-            white-space: nowrap;
-            margin-right: 12px;
-          }}
+        #   /* channel number pill */
+        #   .chan {{
+        #     display: inline-block;
+        #     font-weight: 600;
+        #     font-size: 18px;
+        #     padding: 6px 10px;
+        #     border-radius: 999px;
+        #     background: #e1e1e1;
+        #     color: #7294f2;
+        #     border: 1px solid #dbe5ff;
+        #     white-space: nowrap;
+        #     margin-right: 12px;
+        #   }}
 
-          /* logo box (avoid object-fit) */
-          .icon {{
-            display: inline-block;
-            width: 120px; height: 120px;   /* smaller for wkhtml; adjust as needed */
-            overflow: hidden;
-            border-radius: 12px;
-            border: 1px solid #e6e9ef;
-            vertical-align: middle;
-            margin-right: 14px;
-            background: transparent;
-          }}
-          .icon img {{
-            max-width: 100%;
-            max-height: 100%;
-            display: block;
-            background: transparent;
-          }}
+        #   /* logo box (avoid object-fit) */
+        #   .icon {{
+        #     display: inline-block;
+        #     width: 120px; height: 120px;   /* smaller for wkhtml; adjust as needed */
+        #     overflow: hidden;
+        #     border-radius: 12px;
+        #     border: 1px solid #e6e9ef;
+        #     vertical-align: middle;
+        #     margin-right: 14px;
+        #     background: transparent;
+        #   }}
+        #   .icon img {{
+        #     max-width: 100%;
+        #     max-height: 100%;
+        #     display: block;
+        #     background: transparent;
+        #   }}
 
-          .name {{
-            display: inline-block;
-            vertical-align: middle;
-            max-width: calc(100% - 150px); /* crude but works in wkhtml */
-            font-size: 24px;
-            line-height: 1.35;
-            font-weight: 600;
-            letter-spacing: 0.01em;
-            color: #0b1220;
-            white-space: normal;
-            word-break: break-word;
-            /* avoid text-wrap/hyphens for compatibility */
-          }}
-        </style>
-        """
-
+        #   .name {{
+        #     display: inline-block;
+        #     vertical-align: middle;
+        #     max-width: calc(100% - 150px); /* crude but works in wkhtml */
+        #     font-size: 24px;
+        #     line-height: 1.35;
+        #     font-weight: 600;
+        #     letter-spacing: 0.01em;
+        #     color: #0b1220;
+        #     white-space: normal;
+        #     word-break: break-word;
+        #     /* avoid text-wrap/hyphens for compatibility */
+        #   }}
+        # </style>
+        # """
+        style_css = TooManyStreamsConfig.get_plugin_config("stream_channel_css") or DEFAULT_CSS
+        style = f"""<style>
+        {style_css}
+        </style>"""
+        style = style.replace("REPLACE_WITH_PERCENT", str(REPLACE_WITH_PERCENT))
+        self.logger.debug(f"Using {self.html_cols} columns, each card width: {REPLACE_WITH_PERCENT}%")
+        self.logger.debug(f"Using CSS:\n{style}")
         # Build cards (embed local files as data: URIs to avoid path issues)
         cards = []
         for index, channel_data in enumerate(self.active_streams):
