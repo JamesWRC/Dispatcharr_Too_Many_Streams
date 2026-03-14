@@ -2,217 +2,116 @@
 
 import os
 import json
+import logging
 
+logger = logging.getLogger('plugins.too_many_streams.TooManyStreamsConfig')
 
-DEFAULT_CSS = """
-    html, body {
-    width: 1920px; height: 1080px; margin: 0; background: #fff; color: #111;
-    font-family: Arial, "Segoe UI", Roboto, sans-serif; /* simple stack */
-    }
-
-    /* Center whole block */
-    body {
-    text-align: center; /* minimal, avoids flex */
-    }
-    .wrap {
-    width: 92%;
-    max-width: 1680px;
-    margin: 0 auto;
-    display: block;
-    }
-
-    h1 {
-    font-size: 48px;  /* fixed size; avoid clamp() */
-    margin: 0 0 12px;
-    }
-    .desc {
-    width: 82%;
-    margin: 0 auto 20px;
-    font-size: 20px;    /* fixed */
-    line-height: 1.45;
-    color: #333;
-    }
-
-    /* ------- Grid replacement (row/column without CSS Grid) ------- */
-    /* Set columns in your template (C = self.html_cols) */
-    /* Each card becomes an inline-block with percentage width */
-    .grid { font-size: 0; /* remove gaps between inline-blocks */ }
-    .card {
-    display: inline-block;
-    vertical-align: top;
-    width: REPLACE_WITH_PERCENT%;  /* = 100 / C, e.g., 50% for 2 cols, 33.333% for 3. This value is calculated via python using the number of channel cols */
-    box-sizing: border-box;
-    padding: 16px 22px;
-    margin: 7px 9px;               /* simulate gap */
-    background: #ffffff;
-    border: 1px solid #e6e9ef;
-    border-radius: 16px;
-    box-shadow: 0 1px 2px rgba(16,24,40,0.04);
-    font-size: 16px; /* restore text size */
-    text-align: left;
-    }
-
-    /* darker stripe for “even” rows: add class server-side */
-    .card_even {
-    display: inline-block;
-    vertical-align: top;
-    width: REPLACE_WITH_PERCENT%;  /* = 100 / C, e.g., 50% for 2 cols, 33.333% for 3. This value is calculated via python using the number of channel cols */
-    box-sizing: border-box;
-    padding: 16px 22px;
-    margin: 7px 9px;               /* simulate gap */
-    background: #e2e2e2;
-    border: 1px solid #e6e9ef;
-    border-radius: 16px;
-    box-shadow: 0 1px 2px rgba(16,24,40,0.04);
-    font-size: 16px; /* restore text size */
-    text-align: left;
-    }
-
-    /* channel number pill */
-    .chan {
-    display: inline-block;
-    font-weight: 600;
-    font-size: 18px;
-    padding: 6px 10px;
-    border-radius: 999px;
-    background: #e1e1e1;
-    color: #7294f2;
-    border: 1px solid #dbe5ff;
-    white-space: nowrap;
-    margin-right: 12px;
-    }
-
-    /* logo box (avoid object-fit) */
-    .icon {
-    display: inline-block;
-    width: 120px; height: 120px;   /* smaller for wkhtml; adjust as needed */
-    overflow: hidden;
-    border-radius: 12px;
-    border: 1px solid #e6e9ef;
-    vertical-align: middle;
-    margin-right: 14px;
-    background: transparent;
-    }
-    .icon img {
-    max-width: 100%;
-    max-height: 100%;
-    display: block;
-    background: transparent;
-    }
-
-    .name {
-    display: inline-block;
-    vertical-align: middle;
-    max-width: calc(100% - 150px); /* crude but works in wkhtml */
-    font-size: 24px;
-    line-height: 1.35;
-    font-weight: 600;
-    letter-spacing: 0.01em;
-    color: #0b1220;
-    white-space: normal;
-    word-break: break-word;
-    /* avoid text-wrap/hyphens for compatibility */
-    }
-"""
+from .schemas import PluginConfig
 
 class TooManyStreamsConfig:
     _STREAM_URL = 'http://{host}:{port}/stream.ts'
     PLUGIN_KEY = 'too_many_streams'
-    PERSISTENT_CONFIG_FOLDER = "persistent_config"
-
-    @staticmethod
-    def get_host_and_port() -> tuple[str, int]:
-        """
-        Returns the host and port for the "Too Many Streams" service.
-        Uses the TMS_HOST and TMS_PORT environment variables if set, otherwise defaults to "
-        """
-        _host = os.environ.get("TMS_HOST", "0.0.0.0")
-        _port = os.environ.get("TMS_PORT", 1337)
-
-        assert isinstance(_host, str)
-        assert isinstance(_port, (str, int)) and str(_port).isdigit(), "TMS_PORT must be an integer"
-
-        return (_host, _port)
+    _cached_config = None
     
-    @staticmethod
-    def get_stream_url() -> str:
-        """
-        Returns the URL where the "Too Many Streams" image can be accessed.
-        Uses the host and port from environment variables or defaults.
-        """
-        host, port = TooManyStreamsConfig.get_host_and_port()
-        return TooManyStreamsConfig._STREAM_URL.format(host=host, port=port)
-    
-
-    @staticmethod
-    def get_plugin_config(config_key:str=None):
-        """
-        Retrieves the plugin configuration from the database for the given config_key.
-        If config_key is None, returns the entire settings dictionary.
-        Args:
-            config_key (str): The specific configuration key to retrieve. If None, returns the entire settings dict.
-        Returns:
-            The value associated with the config_key, the entire settings dictionary if config_key is None, or None if not found."""
-        from apps.plugins.models import PluginConfig
-        try:
-            if cfg := PluginConfig.objects.filter(key=TooManyStreamsConfig.PLUGIN_KEY).first():
-                print(f"cfg.settings={cfg.settings}")
-                st = dict(cfg.settings or {})
-                # If no config key is provided, return the whole settings dict
-                if config_key is None:
-                    return st
-                
-                val = st.get(config_key, None)
-                print(f"TooManyStreamsConfig: Found plugin config for key {TooManyStreamsConfig.PLUGIN_KEY}, returning {config_key}={val}")
-                return val
-            else:
-                print(f"TooManyStreamsConfig: No plugin config found for key {TooManyStreamsConfig.PLUGIN_KEY}")
-                return TooManyStreamsConfig.get_plugin_persistent_config().get(config_key, None)
-
-        except Exception as e:
-            print(f"TooManyStreamsConfig: Error retrieving plugin config for key {TooManyStreamsConfig.PLUGIN_KEY}: {e}")
-            TooManyStreamsConfig.get_plugin_persistent_config().get(config_key, None)
-            return None
-            
-
     @staticmethod
     def get_persistent_storage_path() -> str:
-        """
-        Returns the path to the persistent storage file for the plugin configuration.
-        The file is located two directories above this file's directory.
-        """
-        plugin_root_dir = os.path.dirname(os.path.abspath(__file__))
-        # go up 2 directories
-        plugin_dir = os.path.dirname(os.path.dirname(plugin_root_dir))
-        config_file = os.path.join(plugin_dir, TooManyStreamsConfig.PERSISTENT_CONFIG_FOLDER, "too_many_streams_persistent_config.json")
-        if not os.path.exists(os.path.dirname(config_file)):
-            os.makedirs(os.path.dirname(config_file), exist_ok=True)
-        return config_file
+        # User specified path: data/plugins/TMS_Persistent_Config
+        target_dir = "/data/plugins/TMS_Persistent_Config"
+        os.makedirs(target_dir, exist_ok=True)
+        return os.path.join(target_dir, "too_many_streams_persistent_config.json")
 
     @staticmethod
-    def get_plugin_persistent_config():
-        """
-        Loads and returns the plugin persistent config from the persistent storage path as a dictionary.
-        If the file does not exist or cannot be read, returns an empty dictionary.
-        """
+    def get_plugin_persistent_config() -> dict:
         config_path = TooManyStreamsConfig.get_persistent_storage_path()
         if os.path.exists(config_path):
             try:
                 with open(config_path, "r") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                    logger.info(f"Persistent config file FOUND at {config_path}")
+                    return data
             except Exception as e:
-                print(f"TooManyStreamsConfig: Error loading config from {config_path}: {e}")
-                return {}
+                logger.error(f"Error loading config from {config_path}: {e}")
         else:
-            return {}
+            logger.info(f"No persistent config file found at {config_path}")
+        return {}
+
+    @staticmethod
+    def clear_cache():
+        """Clears the cached configuration, forcing a reload on the next get_config() call."""
+        TooManyStreamsConfig._cached_config = None
+        logger.info("Plugin configuration cache cleared.")
+
+    @staticmethod
+    def get_config() -> PluginConfig:
+        # 0. Check cache first
+        if TooManyStreamsConfig._cached_config is not None:
+            return TooManyStreamsConfig._cached_config
+
+        from apps.plugins.models import PluginConfig as DbPluginConfig
+        
+        # Start with hardcoded defaults from the class
+        final_data = {
+            "stream_title": PluginConfig.stream_title,
+            "stream_description": PluginConfig.stream_description,
+            "stream_channel_cols": PluginConfig.stream_channel_cols,
+            "tms_log_level": PluginConfig.tms_log_level,
+        }
+
+        # 1. Load from database (Dispatcharr UI settings)
+        try:
+            if db_config := DbPluginConfig.objects.filter(key=TooManyStreamsConfig.PLUGIN_KEY).first():
+                if db_config.settings:
+                    logger.info("Merging settings from DB")
+                    final_data.update(db_config.settings)
+        except Exception as e:
+            logger.error(f"Error retrieving plugin config from DB: {e}")
+
+        # 2. Load from persistent config file (USER SPECIFIED LOCATION - HIGH PRIORITY)
+        persistent_data = TooManyStreamsConfig.get_plugin_persistent_config()
+        if persistent_data:
+            logger.info("Overriding with file settings from TMS_Persistent_Config")
+            final_data.update(persistent_data)
+
+        # 3. Load from environment variables (FINAL OVERRIDE)
+        env_config = {
+            "tms_image_path": os.environ.get("TMS_IMAGE_PATH"),
+            "tms_log_level": os.environ.get("TMS_LOG_LEVEL", os.environ.get("DISPATCHARR_LOG_LEVEL", "INFO")).upper(),
+        }
+        env_config = {k: v for k, v in env_config.items() if v is not None}
+        if env_config:
+            final_data.update(env_config)
+
+        logger.info(f"FINAL RESOLVED CONFIG: {final_data}")
+        TooManyStreamsConfig._cached_config = PluginConfig.from_dict(final_data)
+        return TooManyStreamsConfig._cached_config
+
+    @staticmethod
+    def get_plugin_config(config_key:str=None):
+        """DEPRECATED: Use get_config() instead."""
+        config = TooManyStreamsConfig.get_config()
+        if config_key is None:
+            return config.dict()
+        return getattr(config, config_key, None)
+
+    @staticmethod
+    def get_host_and_port() -> tuple[str, int]:
+        _host = os.environ.get("TMS_HOST", "0.0.0.0")
+        _port = int(os.environ.get("TMS_PORT", 1337))
+        return (_host, _port)
+    
+    @staticmethod
+    def get_stream_url() -> str:
+        host, port = TooManyStreamsConfig.get_host_and_port()
+        display_host = "127.0.0.1" if host == "0.0.0.0" else host
+        return TooManyStreamsConfig._STREAM_URL.format(host=display_host, port=port)
+            
     @staticmethod
     def save_plugin_persistent_config(config: dict):
-        """
-        Saves the provided config dictionary to the persistent storage path as JSON.
-        """
         config_path = TooManyStreamsConfig.get_persistent_storage_path()
         try:
             with open(config_path, "w") as f:
                 json.dump(config, f, indent=4)
+            logger.info(f"Successfully saved config to {config_path}")
+            TooManyStreamsConfig.clear_cache()
         except Exception as e:
-            print(f"TooManyStreamsConfig: Error saving config to {config_path}: {e}")
+            logger.error(f"Error saving config to {config_path}: {e}")
