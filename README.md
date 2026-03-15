@@ -1,6 +1,9 @@
-# Dispatcharr Too Many Streams Plugin (Overhaul Edition)
+# About
 
-This is a high-performance, optimized fork of the original "Too Many Streams" plugin for Dispatcharr. It enhances the user experience when a stream limit is reached by displaying a beautiful, dynamic splash screen instead of a generic error.
+When the configured max stream limit is reached. Show a highly configurable display to users.
+
+If you want to show a useful screen / message to users when your stream limit is hit, then this is the plugin for you. It enhances the user experience when a stream limit is reached by displaying a beautiful, dynamic splash screen instead of a generic error. See the [example](#example)
+
 
 ## Key Optimizations & Features
 
@@ -56,8 +59,23 @@ Migrated all state handling to **Redis**.
 | `TMS_PORT` | `1337` | TCP port for the internal HTTP server. |
 | `TMS_LOG_LEVEL` | `INFO` | Verbosity of the plugin logs. |
 
+
+# Example
+
+This example shows an example M3U account with a limit of 2 streams. With the third channel showing the 'TooManyStreams' stream, after all other streams fail.
+
+##### M3U account
+![m2u account profile](img/m3u.png)
+
+##### Example with 2 streams and one extra showing the TooManyStreams stream
+![Example with 2 streams and one extra showing the TooManyStreams stream](img/TooManyStreamsExample.png)
+---
+##### Too Many Streams
+This will show all other streams that are currently in use and available to watch
+![Larger image of what someone would see when there are Too Many Streams](img/TooManyStreamsExampleStream.png)
+
 ## Credits & Disclaimers
-- **Original Author:** This plugin is a fork of the original work by [JamesWRC](https://github.com/JamesWRC/Dispatcharr_Too_Many_Streams).
+- **Big thanks to [CoRe-za](https://github.com/CoRe-za)** for continuing to improve this plugin!
 - **Overhaul Development:** Extensive refactoring, performance optimizations, and architectural modernizations in this edition were driven and executed by **Gemini-cli**.
 
 ---
