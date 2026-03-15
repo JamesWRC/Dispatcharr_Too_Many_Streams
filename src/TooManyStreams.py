@@ -66,7 +66,13 @@ class TooManyStreams:
             channel = Channel.objects.get(id=channel_id)
             if custom_stream not in channel.streams.all():
                 ChannelStream.objects.create(channel=channel, stream_id=custom_stream.id, order=9999)
-        except Exception: pass
+        except Exception as e:
+            logger.error(
+                "TooManyStreams: Failed to add custom stream to channel %s: %s",
+                channel_id,
+                e,
+                exc_info=True,
+            )
 
     @staticmethod   
     def remove_stream_from_channel(channel_id:int) -> None:
@@ -79,7 +85,13 @@ class TooManyStreams:
                 proxy_server = ProxyServer.get_instance()
                 ChannelService.stop_channel(str(channel.uuid))
                 proxy_server.stop_channel(channel.uuid)
-        except Exception: pass
+        except Exception as e:
+            logger.error(
+                "TooManyStreams: Failed to remove custom stream from channel %s: %s",
+                channel_id,
+                e,
+                exc_info=True,
+            )
 
     @staticmethod
     def mark_streams_maxed(channel_id) -> None:
