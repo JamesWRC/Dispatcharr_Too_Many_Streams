@@ -8,8 +8,8 @@ rm -rf zips/staging/too_many_streams/*
 # Copy necessary files
 cp plugin.py zips/staging/too_many_streams
 cp __init__.py zips/staging/too_many_streams
+cp plugin.json zips/staging/too_many_streams
 cp -r src zips/staging/too_many_streams
 
 # Create the zip file
 (cd zips/staging && zip -r ../too_many_streams.zip too_many_streams)
-

@@ -1,0 +1,126 @@
+{
+  "name": "too_many_streams",
+  "version": "2.2.3",
+  "description": "Handles scenarios where too many streams are open and what users see. Features a customizable dynamic splash screen.",
+  "author": "JamesWRC",
+  "fields": [
+    {
+      "id": "stream_title",
+      "label": "Stream Title",
+      "type": "string",
+      "default": "Sorry, this channel is unavailable.",
+      "placeholder": "The title displayed on the 'Too Many Streams' image.",
+      "help_text": "The title displayed on the 'Too Many Streams' image."
+    },
+    {
+      "id": "stream_description",
+      "label": "Stream Description",
+      "type": "string",
+      "default": "While this channel is not currently available, here are some other channels you can watch.",
+      "placeholder": "The description displayed on the 'Too Many Streams' image.",
+      "help_text": "The description displayed on the 'Too Many Streams' image."
+    },
+    {
+      "id": "stream_channel_cols",
+      "label": "Number of channel columns",
+      "type": "number",
+      "default": 5,
+      "placeholder": "The number of columns of channels to display on the 'Too Many Streams' image.",
+      "help_text": "The number of columns of channels to display on the 'Too Many Streams' image."
+    },
+    {
+      "id": "tms_image_path",
+      "label": "Static Image Path",
+      "type": "string",
+      "default": null,
+      "placeholder": "Path to a static image to use instead of the dynamic image.",
+      "help_text": "Path to a static image to use instead of the dynamic image."
+    },
+    {
+      "id": "tms_log_level",
+      "label": "Log Level",
+      "type": "string",
+      "default": "INFO",
+      "placeholder": "Log level for the plugin.",
+      "help_text": "Log level for the plugin."
+    },
+    {
+      "id": "video_encoder",
+      "label": "Video Encoder",
+      "type": "string",
+      "default": "libx264",
+      "placeholder": "libx264",
+      "help_text": "FFmpeg encoder (e.g., libx264, h264_nvenc, h264_qsv, h264_omx, h264_videotoolbox). Use libx264 if unsure."
+    },
+    {
+      "id": "theme_bg_color",
+      "label": "Background Color",
+      "type": "string",
+      "default": "#0F172A",
+      "placeholder": "#0F172A",
+      "help_text": "Hex code for the main background."
+    },
+    {
+      "id": "theme_card_bg_color",
+      "label": "Card Background Color",
+      "type": "string",
+      "default": "#1E293B",
+      "placeholder": "#1E293B",
+      "help_text": "Hex code for the channel card background."
+    },
+    {
+      "id": "theme_card_border_color",
+      "label": "Card Border Color",
+      "type": "string",
+      "default": "#334155",
+      "placeholder": "#334155",
+      "help_text": "Hex code for the card border."
+    },
+    {
+      "id": "theme_text_color",
+      "label": "Text Color",
+      "type": "string",
+      "default": "#F8FAFC",
+      "placeholder": "#F8FAFC",
+      "help_text": "Hex code for the main text."
+    },
+    {
+      "id": "theme_accent_color",
+      "label": "Accent Color",
+      "type": "string",
+      "default": "#38BDF8",
+      "placeholder": "#38BDF8",
+      "help_text": "Hex code for accents (e.g., channel number pill)."
+    },
+    {
+      "id": "theme_accent_text_color",
+      "label": "Accent Text Color",
+      "type": "string",
+      "default": "#0F172A",
+      "placeholder": "#0F172A",
+      "help_text": "Hex code for text inside accent pills."
+    }
+  ],
+  "actions": [
+    {
+      "id": "apply_too_many_streams",
+      "label": "Apply 'Too Many Streams' to channels",
+      "description": "Adds the 'Too Many Streams' stream to the bottom of all channels."
+    },
+    {
+      "id": "remove_too_many_streams",
+      "label": "Remove 'Too Many Streams' from channels",
+      "description": "Removes the 'Too Many Streams' stream from all channels."
+    },
+    {
+      "id": "save_plugin_config",
+      "label": "Save Plugin Config",
+      "description": "Saves the current plugin configuration to persistent storage."
+    },
+    {
+      "id": "search_for_config",
+      "label": "Search for Persistent Config",
+      "description": "Manually searches for and reloads the persistent configuration file from disk."
+    }
+  ]
+}
