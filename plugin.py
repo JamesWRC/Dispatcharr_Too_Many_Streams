@@ -202,6 +202,7 @@ class Plugin:
         image_to_use = config.tms_image_path
 
         TooManyStreams.install_get_stream_override()
+        TooManyStreams.install_stream_manager_log_filter()
 
         if not self._can_bind(HOST, PORT):
             logger.error(f"Too Many Streams: Could not bind to {HOST}:{PORT}. Port might be in use.")

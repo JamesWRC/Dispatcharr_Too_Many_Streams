@@ -1,0 +1,12 @@
+{
+  "python.envFile": "${workspaceFolder}/.env",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}",
+    "${workspaceFolder}/Dispatcharr"
+  ],
+  "python.autoComplete.extraPaths": [
+    "${workspaceFolder}",
+    "${workspaceFolder}/Dispatcharr"
+  ],
+  "python.testing.cwd": "${workspaceFolder}/Dispatcharr"
+}

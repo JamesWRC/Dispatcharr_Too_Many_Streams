@@ -3,6 +3,8 @@
 import logging
 import os
 import threading
+import re
+import time
 
 from apps.channels.models import Channel, ChannelStream, Stream
 from apps.proxy.ts_proxy.server import ProxyServer
@@ -23,6 +25,70 @@ class TooManyStreams:
     TMS_MAXED_COUNTER = 1
     
     REFRESH_SIGNAL = threading.Event()
+    _stream_manager_filter_installed = False
+
+    class _TmsStreamInfoFilter(logging.Filter):
+        """
+        Suppress noisy stream-manager info lines only for active TooManyStreams channels.
+        Ignores logs that spam: 
+            2026-03-15 03:43:01,741 INFO ts_proxy.stream_manager Stream info for channel ded35132-7950-4e82-b628-60eecad7ce05: [aist#0:1/aac @ 0x562b7fcf8040] timestamp discontinuity (stream id=257): 35240067, new offset= -93629957761
+        """
+
+        _MSG_PATTERN = re.compile(r"Stream info for channel ([^:]+):")
+
+        def __init__(self, ttl_sec: int = 10):
+            super().__init__()
+            self.ttl_sec = ttl_sec
+            self._cache = {}
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+                if "Stream info for channel " not in msg:
+                    return True
+
+                match = self._MSG_PATTERN.search(msg)
+                if not match:
+                    return True
+
+                channel_id = match.group(1)
+                if self._is_tms_channel(channel_id):
+                    return False
+            except Exception:
+                # Never block logs if filter logic fails.
+                return True
+            return True
+
+        def _is_tms_channel(self, channel_id: str) -> bool:
+            now = time.time()
+            cached = self._cache.get(channel_id)
+            if cached and cached[0] > now:
+                return cached[1]
+
+            is_tms = False
+            try:
+                redis_client = RedisClient.get_client()
+                metadata_key = f"ts_proxy:channel:{channel_id}:metadata"
+                stream_id_raw = redis_client.hget(metadata_key, "stream_id")
+                if stream_id_raw:
+                    stream_id = int(stream_id_raw.decode("utf-8") if isinstance(stream_id_raw, bytes) else stream_id_raw)
+                    stream_url = Stream.objects.filter(id=stream_id).values_list("url", flat=True).first()
+                    is_tms = bool(stream_url and stream_url == TooManyStreamsConfig.get_stream_url())
+            except Exception:
+                is_tms = False
+
+            self._cache[channel_id] = (now + self.ttl_sec, is_tms)
+            return is_tms
+
+    @staticmethod
+    def install_stream_manager_log_filter():
+        if TooManyStreams._stream_manager_filter_installed:
+            return
+
+        target_logger = logging.getLogger("ts_proxy.stream_manager")
+        target_logger.addFilter(TooManyStreams._TmsStreamInfoFilter())
+        TooManyStreams._stream_manager_filter_installed = True
+        logger.info("TooManyStreams: Installed ts_proxy.stream_manager filter for TMS stream-info noise")
 
     @staticmethod
     def check_requirements_met() -> bool:

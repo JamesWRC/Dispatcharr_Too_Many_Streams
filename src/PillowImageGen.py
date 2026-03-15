@@ -62,6 +62,15 @@ class PillowImageGen:
         except Exception: pass
         return None
 
+    @staticmethod
+    def _format_channel_number(channel_number) -> str:
+        """Format channel numbers so whole floats (e.g. 13.0) render as 13."""
+        try:
+            num = float(channel_number)
+        except (TypeError, ValueError):
+            return str(channel_number)
+        return str(int(num)) if num.is_integer() else str(num)
+
     def get_active_streams(self) -> bool:
         """
         Fetches active streams and populates self.active_streams.
@@ -89,7 +98,7 @@ class PillowImageGen:
             if not active_uuids: 
                 self.active_streams = []
             else:
-                channels = Channel.objects.filter(uuid__in=active_uuids).only('id', 'name', 'logo', 'uuid')
+                channels = Channel.objects.filter(uuid__in=active_uuids).only('channel_number', 'name', 'logo', 'uuid')
                 active_list = []
                 tms_url = TooManyStreamsConfig.get_stream_url()
                 
@@ -97,16 +106,22 @@ class PillowImageGen:
                     channel_info = ChannelStatus.get_basic_channel_info(str(ch.uuid))
                     if channel_info.get("url") == tms_url:
                         continue
+
+                    display_number = self._format_channel_number(ch.channel_number)
                     
                     active_list.append((
-                        f"#{ch.id}", 
+                        f"#{display_number}",
                         ch.logo.url if ch.logo else "", 
                         ch.name
                     ))
                 
                 def channel_sort_key(item):
                     num_str = item[0].lstrip("#")
-                    return int(num_str) if num_str.isdigit() else 999999
+                    self.logger.info(f"TMS: Sorting channel number {num_str}")
+                    try:
+                        return float(num_str)
+                    except (TypeError, ValueError):
+                        return 999999
                 
                 active_list.sort(key=channel_sort_key)
                 self.active_streams = active_list[:15] 
