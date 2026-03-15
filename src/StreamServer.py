@@ -198,7 +198,13 @@ class StreamServer:
 
                 try:
                     while True:
-                        chunk = q.get()
+                        try:
+                            chunk = q.get(timeout=1.0)
+                        except queue.Empty:
+                            # Periodically wake up to check if the connection is still open
+                            if getattr(self.wfile, "closed", False):
+                                break
+                            continue
                         self.wfile.write(chunk)
                 except (ConnectionResetError, BrokenPipeError):
                     pass
