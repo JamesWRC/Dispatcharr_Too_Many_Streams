@@ -41,7 +41,15 @@ class Plugin:
     initialized = False
 
     # LOAD FILE-BASED DEFAULTS FOR THE UI FROM USER SPECIFIED PATH
-    _file_config = TooManyStreamsConfig.get_plugin_persistent_config()
+    try:
+        _file_config = TooManyStreamsConfig.get_plugin_persistent_config()
+    except Exception as e:
+        logger.warning(
+            "Failed to load persistent plugin config at import time; "
+            "falling back to in-memory defaults. Error: %s",
+            e,
+        )
+        _file_config = {}
 
     fields = [
         {
