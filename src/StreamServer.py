@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 import queue
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .PillowImageGen import PillowImageGen
@@ -23,6 +24,10 @@ class StreamServer:
         self.clients = []
         self.clients_lock = threading.Lock()
         self.process_lock = threading.Lock()
+        # Keep a small rolling TS prebuffer so newly connected clients can
+        # immediately consume data and lock onto the stream faster.
+        self.prebuffer_chunks = deque(maxlen=48)
+        self.prebuffer_lock = threading.Lock()
         
         # Ensure image directory exists
         os.makedirs(os.path.dirname(self.image_path), exist_ok=True)
@@ -37,10 +42,12 @@ class StreamServer:
         
         cmd = [
             self.ffmpeg_bin, 
+            "-nostdin",
             "-loop", "1", 
-            "-framerate", "1", 
+            "-framerate", "25", 
             "-i", img_path,
             "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-fflags", "+genpts",
             "-c:v", encoder,
         ]
         
@@ -50,14 +57,19 @@ class StreamServer:
         elif "qsv" in encoder:
              cmd.extend(["-preset", "veryfast"])
         else:
-             cmd.extend(["-preset", "ultrafast", "-tune", "stillimage"])
+             cmd.extend(["-preset", "ultrafast", "-tune", "zerolatency"])
 
         cmd.extend([
-            "-r", "1", 
-            "-g", "1",
+            "-pix_fmt", "yuv420p",
+            "-r", "25", 
+            "-g", "50",
+            "-keyint_min", "25",
             "-b:v", "800k", 
             "-c:a", "aac", 
             "-b:a", "96k", 
+            "-mpegts_flags", "+resend_headers",
+            "-muxdelay", "0",
+            "-muxpreload", "0",
             "-f", "mpegts", 
             "pipe:1"
         ])
@@ -91,6 +103,8 @@ class StreamServer:
                     stdout=subprocess.PIPE, 
                     stderr=subprocess.DEVNULL
                 )
+                with self.prebuffer_lock:
+                    self.prebuffer_chunks.clear()
             except Exception as e:
                 logger.error(f"Failed to start FFmpeg: {e}")
                 self.process = None
@@ -134,14 +148,6 @@ class StreamServer:
                          self._start_ffmpeg()
                 continue
             
-            # Optimization: Pause if no clients
-            with self.clients_lock:
-                has_clients = len(self.clients) > 0
-
-            if not has_clients:
-                time.sleep(1)
-                continue
-
             try:
                 buf = proc.stdout.read(1316 * 16) # Read 16 MPEG-TS packets
                 if not buf:
@@ -153,6 +159,9 @@ class StreamServer:
                             self._start_ffmpeg()
                     time.sleep(0.1)
                     continue
+
+                with self.prebuffer_lock:
+                    self.prebuffer_chunks.append(buf)
                 
                 with self.clients_lock:
                     for q in self.clients[:]:
@@ -177,6 +186,8 @@ class StreamServer:
         server_instance = self
 
         class StreamHTTPHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_GET(self):
                 if self.path not in ("/", "/stream.ts"):
                     self.send_response(404)
@@ -187,11 +198,21 @@ class StreamServer:
                 self.send_header("Content-Type", "video/mp2t")
                 self.send_header("Connection", "keep-alive")
                 self.send_header("Cache-Control", "no-cache")
+                self.send_header("Pragma", "no-cache")
                 self.end_headers()
 
                 q = queue.Queue(maxsize=50)
                 with server_instance.clients_lock:
                     server_instance.clients.append(q)
+
+                # Prime this client with the most recent TS chunks.
+                with server_instance.prebuffer_lock:
+                    warmup_chunks = list(server_instance.prebuffer_chunks)
+                for buffered in warmup_chunks:
+                    try:
+                        q.put_nowait(buffered)
+                    except queue.Full:
+                        break
                 
                 # Trigger a refresh
                 server_instance.refresh_signal.set()
@@ -206,6 +227,7 @@ class StreamServer:
                                 break
                             continue
                         self.wfile.write(chunk)
+                        self.wfile.flush()
                 except (ConnectionResetError, BrokenPipeError):
                     pass
                 except Exception as e:
