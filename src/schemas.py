@@ -11,7 +11,8 @@ class PluginConfig:
     
     # Advanced / Performance
     video_encoder: str = "libx264"
-    
+    idle_shutdown_seconds: int = 30
+
     # Theme Colors
     theme_bg_color: str = "#0F172A"
     theme_card_bg_color: str = "#1E293B"
@@ -30,7 +31,8 @@ class PluginConfig:
             tms_log_level=str(data.get("tms_log_level", cls.tms_log_level)).upper(),
             
             video_encoder=str(data.get("video_encoder", cls.video_encoder)),
-            
+            idle_shutdown_seconds=int(data.get("idle_shutdown_seconds", cls.idle_shutdown_seconds)),
+
             theme_bg_color=str(data.get("theme_bg_color", cls.theme_bg_color)),
             theme_card_bg_color=str(data.get("theme_card_bg_color", cls.theme_card_bg_color)),
             theme_card_border_color=str(data.get("theme_card_border_color", cls.theme_card_border_color)),

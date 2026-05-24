@@ -20,7 +20,9 @@ Optimized for every server type, from Raspberry Pis to GPU-powered workstations.
 
 ### 📡 Scalable Video Streaming
 Optimized the FFmpeg implementation using a **Broadcaster/Subscriber** model.
+- **On-Demand Encoder:** FFmpeg only runs while at least one client is connected. After the last client disconnects, the encoder shuts down (configurable grace period, default 30s). **Idle CPU/GPU cost drops to zero.**
 - **Single Process:** Only one FFmpeg process runs at a time, regardless of how many users are watching.
+- **Rolling Prebuffer:** Second and later clients joining an active stream are seeded with a rolling prebuffer for instant playback (no wait for the next keyframe).
 - **Native Pillow Engine:** Replaced heavy browser-based rendering with lightweight Pillow-based image generation.
 - **Bandwidth Efficient:** Uses a highly optimized 1 FPS stream to minimize network overhead.
 
@@ -50,6 +52,7 @@ Migrated all state handling to **Redis**.
 | **Stream Title** | "Sorry, this channel is unavailable." | The main headline on the splash screen. |
 | **Number of Columns** | `5` | How many channel cards to show side-by-side in the grid. |
 | **Video Encoder** | `libx264` | The FFmpeg encoder to use (e.g., `h264_nvenc`). |
+| **Idle Shutdown (seconds)** | `30` | Seconds to keep the encoder running after the last client disconnects. Lower = less CPU/GPU at idle; higher = faster reconnect. Minimum 5. |
 | **Theme Colors** | (Various) | Fully customizable hex codes for every UI element. |
 
 ### Environment Variables

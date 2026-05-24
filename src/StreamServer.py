@@ -1,3 +1,4 @@
+import collections
 import logging
 import os
 import shutil
@@ -21,12 +22,15 @@ class StreamServer:
         
         self.process = None
         self.clients = []
+        self.prebuffer = collections.deque(maxlen=48)
         self.clients_lock = threading.Lock()
         self.process_lock = threading.Lock()
-        
+        self._last_active = time.monotonic()
+        self._stop_event = threading.Event()
+
         # Ensure image directory exists
         os.makedirs(os.path.dirname(self.image_path), exist_ok=True)
-        
+
         self.ffmpeg_bin = shutil.which("ffmpeg")
         if not self.ffmpeg_bin:
             logger.error("FFmpeg not found! StreamServer cannot start.")
@@ -65,35 +69,46 @@ class StreamServer:
         return cmd
 
     def _start_ffmpeg(self):
+        """Acquires process_lock and starts/restarts ffmpeg."""
         with self.process_lock:
-            if self.process:
-                try:
-                    if self.process.poll() is None:
-                        self.process.terminate()
-                        try:
-                            self.process.wait(timeout=1)
-                        except subprocess.TimeoutExpired:
-                            self.process.kill()
-                except Exception as e:
-                    logger.warning(f"Error terminating FFmpeg: {e}")
-            
-            if not os.path.exists(self.image_path):
-                 try:
-                     PillowImageGen(out_path=self.image_path).generate(force=True)
-                 except Exception as e:
-                     logger.error(f"Failed to generate initial image: {e}")
+            self._start_ffmpeg_unlocked()
 
-            cmd = self._get_ffmpeg_cmd(self.image_path)
-            # logger.debug(f"Starting FFmpeg: {' '.join(cmd)}")
+    def _start_ffmpeg_unlocked(self):
+        """Caller MUST hold self.process_lock."""
+        if self.process:
             try:
-                self.process = subprocess.Popen(
-                    cmd, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.DEVNULL
-                )
+                if self.process.poll() is None:
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        try: self.process.wait(timeout=1)
+                        except subprocess.TimeoutExpired: pass
             except Exception as e:
-                logger.error(f"Failed to start FFmpeg: {e}")
-                self.process = None
+                logger.warning(f"Error terminating FFmpeg: {e}")
+
+        if not os.path.exists(self.image_path):
+            try:
+                PillowImageGen(out_path=self.image_path).generate(force=True)
+            except Exception as e:
+                logger.error(f"Failed to generate initial image: {e}")
+
+        # Stale chunks from the previous encoder must not leak into the new stream.
+        with self.clients_lock:
+            self.prebuffer.clear()
+
+        cmd = self._get_ffmpeg_cmd(self.image_path)
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            self._last_active = time.monotonic()
+        except Exception as e:
+            logger.error(f"Failed to start FFmpeg: {e}")
+            self.process = None
 
     def _image_updater_loop(self):
         logger.info("Starting Image Updater loop")
@@ -115,26 +130,27 @@ class StreamServer:
                 # If content changed or we were explicitly signaled
                 if gen.get_active_streams() or signaled:
                     if gen.generate():
-                        logger.info("Image updated, restarting FFmpeg stream.")
-                        self._start_ffmpeg()
+                        logger.info("Image updated.")
+                        # Only restart ffmpeg if a stream is actually being served.
+                        # Idle: image is regenerated to disk; encoder stays off.
+                        with self.process_lock:
+                            if self.process is not None and self.process.poll() is None:
+                                logger.info("Restarting FFmpeg with new image.")
+                                self._start_ffmpeg_unlocked()
             except Exception as e:
                 logger.error(f"Image update failed: {e}")
 
     def _broadcaster_loop(self):
         logger.info("Starting Broadcaster loop")
         while True:
-            # Safely get current process
+            # Safely get current process; broadcaster never spawns in the on-demand model.
             proc = self.process
-            
+
             if not proc or not proc.stdout or proc.stdout.closed:
                 time.sleep(0.5)
-                # Check if we need to restart (e.g. startup failure)
-                with self.process_lock:
-                     if self.process is None:
-                         self._start_ffmpeg()
                 continue
-            
-            # Optimization: Pause if no clients
+
+            # Optimization: Pause if no clients (fast path during idle).
             with self.clients_lock:
                 has_clients = len(self.clients) > 0
 
@@ -145,16 +161,18 @@ class StreamServer:
             try:
                 buf = proc.stdout.read(1316 * 16) # Read 16 MPEG-TS packets
                 if not buf:
-                    # Stream ended?
-                    if proc.poll() is not None:
-                        # Only restart if it's still the SAME process object (wasn't replaced by updater)
-                        if self.process == proc:
-                            logger.warning("FFmpeg process exited. Restarting.")
-                            self._start_ffmpeg()
+                    # Stream ended unexpectedly. Clear self.process and let the next
+                    # client request respawn via do_GET. No auto-restart here.
+                    if proc.poll() is not None and self.process is proc:
+                        logger.warning("FFmpeg process exited; will respawn on next client.")
+                        with self.process_lock:
+                            if self.process is proc:
+                                self.process = None
                     time.sleep(0.1)
                     continue
-                
+
                 with self.clients_lock:
+                    self.prebuffer.append(buf)
                     for q in self.clients[:]:
                         try:
                             q.put_nowait(buf)
@@ -164,14 +182,58 @@ class StreamServer:
                 logger.error(f"Broadcaster error: {e}")
                 time.sleep(1)
 
+    def _idle_watchdog_loop(self):
+        """Shuts ffmpeg down after `idle_shutdown_seconds` with zero clients connected."""
+        logger.info("Starting Idle Watchdog loop")
+        while True:
+            time.sleep(5)
+            try:
+                config = TooManyStreamsConfig.get_config()
+                timeout = max(5, int(getattr(config, "idle_shutdown_seconds", 30)))
+            except Exception:
+                timeout = 30
+
+            with self.clients_lock:
+                has_clients = len(self.clients) > 0
+
+            if has_clients:
+                self._last_active = time.monotonic()
+                continue
+
+            if time.monotonic() - self._last_active < timeout:
+                continue
+
+            # Idle long enough — kill encoder. Re-check under both locks
+            # to close the race with a concurrent client connect.
+            with self.process_lock:
+                with self.clients_lock:
+                    if len(self.clients) > 0:
+                        self._last_active = time.monotonic()
+                        continue
+                    self.prebuffer.clear()
+
+                if self.process and self.process.poll() is None:
+                    logger.info(f"Idle {timeout}s, shutting down FFmpeg.")
+                    try:
+                        self.process.terminate()
+                        try: self.process.wait(timeout=1)
+                        except subprocess.TimeoutExpired:
+                            self.process.kill()
+                            try: self.process.wait(timeout=1)
+                            except subprocess.TimeoutExpired: pass
+                    except Exception as e:
+                        logger.warning(f"Watchdog terminate error: {e}")
+                self.process = None
+
     def start(self):
         if not self.ffmpeg_bin:
             return
 
-        self._start_ffmpeg()
-
+        # NOTE: ffmpeg is NOT started here in the on-demand model.
+        # do_GET spawns it on first client; _idle_watchdog_loop kills it after grace.
         threading.Thread(target=self._image_updater_loop, daemon=True, name="TMS_ImageUpdater").start()
         threading.Thread(target=self._broadcaster_loop, daemon=True, name="TMS_Broadcaster").start()
+        threading.Thread(target=self._idle_watchdog_loop, daemon=True, name="TMS_Watchdog").start()
 
         # Capture 'self' for the handler
         server_instance = self
@@ -190,9 +252,21 @@ class StreamServer:
                 self.end_headers()
 
                 q = queue.Queue(maxsize=50)
-                with server_instance.clients_lock:
-                    server_instance.clients.append(q)
-                
+
+                # Spawn ffmpeg if needed (on-demand) and seed the queue with the
+                # rolling prebuffer BEFORE the broadcaster sees this client, so
+                # prebuffer chunks land before any new chunks the broadcaster
+                # fans out — preserving MPEG-TS continuity for 2nd+ clients.
+                with server_instance.process_lock:
+                    with server_instance.clients_lock:
+                        for chunk in list(server_instance.prebuffer):
+                            try: q.put_nowait(chunk)
+                            except queue.Full: break
+                        server_instance.clients.append(q)
+                        server_instance._last_active = time.monotonic()
+                    if server_instance.process is None or server_instance.process.poll() is not None:
+                        server_instance._start_ffmpeg_unlocked()
+
                 # Trigger a refresh
                 server_instance.refresh_signal.set()
 

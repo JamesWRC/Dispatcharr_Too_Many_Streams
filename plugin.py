@@ -101,6 +101,14 @@ class Plugin:
             "help_text": "FFmpeg encoder (e.g., libx264, h264_nvenc, h264_qsv, h264_omx, h264_videotoolbox). Use libx264 if unsure.",
         },
         {
+            "id": "idle_shutdown_seconds",
+            "label": "Idle Shutdown (seconds)",
+            "type": "number",
+            "default": int(_file_config.get("idle_shutdown_seconds", 30)),
+            "placeholder": "30",
+            "help_text": "Seconds to keep the encoder running after the last client disconnects. Lower = less CPU/GPU at idle; higher = faster reconnect. Minimum 5.",
+        },
+        {
             "id": "theme_bg_color",
             "label": "Background Color",
             "type": "string",
@@ -192,9 +200,10 @@ class Plugin:
         self.initialize()
 
     def initialize(self):
-        if self.initialized:
+        if Plugin.initialized:
+            logger.info("Too Many Streams plugin already initialized; skipping.")
             return
-            
+
         config = TooManyStreamsConfig.get_config()
         logger.setLevel(config.tms_log_level)
 
@@ -218,7 +227,7 @@ class Plugin:
             daemon=True,
         ).start()
             
-        self.initialized = True
+        Plugin.initialized = True
         logger.info("Too Many Streams plugin initialized.")
 
     @staticmethod
