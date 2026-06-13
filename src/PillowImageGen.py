@@ -4,11 +4,12 @@ import re
 import requests
 import textwrap
 import time
+import uuid
 from PIL import Image, ImageDraw, ImageFont
 from io import BytesIO
 from hashlib import md5
 
-from apps.channels.models import Channel
+from apps.channels.models import Channel, ChannelStream, Stream
 from apps.proxy.ts_proxy.server import ProxyServer
 from apps.proxy.ts_proxy.channel_status import ChannelStatus
 
@@ -71,6 +72,55 @@ class PillowImageGen:
             return str(channel_number)
         return str(int(num)) if num.is_integer() else str(num)
 
+    @staticmethod
+    def _channel_sort_key(item):
+        """Sort grid items by channel number (item[0] looks like '#1015')."""
+        num_str = item[0].lstrip("#")
+        try:
+            return float(num_str)
+        except (TypeError, ValueError):
+            return 999999
+
+    def _get_directory_fallback(self, tms_url):
+        """Channels this plugin manages (those with the TMS stream applied), as a
+        (number, logo, name) grid.
+
+        Returns (items, signature). The signature is stored in _current_uuids so
+        generate()'s change-detection can tell the directory view apart from the
+        active-channel view and from a previous empty render.
+        """
+        try:
+            tms_stream_id = Stream.objects.filter(url=tms_url).values_list('id', flat=True).first()
+            if not tms_stream_id:
+                return [], ['__tms_directory_empty__']
+
+            ch_ids = list(
+                ChannelStream.objects.filter(stream_id=tms_stream_id).values_list('channel_id', flat=True)
+            )
+            if not ch_ids:
+                return [], ['__tms_directory_empty__']
+
+            # Sort + cap in the DB. channel_number is an indexed FloatField, so the
+            # ORDER BY matches the old Python float sort exactly while letting the DB
+            # return just the 15 rows we render -- instead of materializing every
+            # channel that has the placeholder applied (thousands) only to drop all
+            # but 15. This path runs every 60s while the placeholder is on screen.
+            channels = (
+                Channel.objects.filter(id__in=ch_ids)
+                .only('channel_number', 'name', 'logo')
+                .order_by('channel_number')[:15]
+            )
+            items = [
+                (f"#{self._format_channel_number(ch.channel_number)}",
+                 ch.logo.url if ch.logo else "", ch.name)
+                for ch in channels
+            ]
+            signature = ['__tms_directory__'] + [it[0] for it in items]
+            return items, signature
+        except Exception:
+            self.logger.error("Error building TMS directory fallback", exc_info=True)
+            return [], ['__tms_directory_error__']
+
     def get_active_streams(self) -> bool:
         """
         Fetches active streams and populates self.active_streams.
@@ -92,41 +142,52 @@ class PillowImageGen:
                 if cursor == 0: break
             
             active_uuids.sort()
-            self._current_uuids = active_uuids
 
-            # Always fetch the data to ensure self.active_streams is populated for generate()
-            if not active_uuids: 
-                self.active_streams = []
-            else:
+            # ts_proxy also creates metadata keys for streams viewed DIRECTLY by
+            # their stream_hash (a 64-char hex), not only channels keyed by UUID.
+            # The TMS placeholder stream itself does this when previewed/opened,
+            # so its own hash shows up here. A single non-UUID value makes
+            # Channel.objects.filter(uuid__in=...) raise a ValidationError that
+            # aborts the whole lookup and blanks the list (showing "unavailable"
+            # even while real channels are active). Keep only valid channel UUIDs.
+            valid_uuids = []
+            for u in active_uuids:
+                try:
+                    uuid.UUID(str(u))
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                valid_uuids.append(u)
+            active_uuids = valid_uuids
+
+            tms_url = TooManyStreamsConfig.get_stream_url()
+
+            # Build the list of OTHER channels currently streaming real content:
+            # active in ts_proxy, excluding any that are themselves showing the TMS
+            # placeholder (so the screen never lists itself during a failover).
+            active_list = []
+            if active_uuids:
                 channels = Channel.objects.filter(uuid__in=active_uuids).only('channel_number', 'name', 'logo', 'uuid')
-                active_list = []
-                tms_url = TooManyStreamsConfig.get_stream_url()
-                
                 for ch in channels:
-                    channel_info = ChannelStatus.get_basic_channel_info(str(ch.uuid))
+                    channel_info = ChannelStatus.get_basic_channel_info(str(ch.uuid)) or {}
                     if channel_info.get("url") == tms_url:
                         continue
-
                     display_number = self._format_channel_number(ch.channel_number)
-                    
-                    active_list.append((
-                        f"#{display_number}",
-                        ch.logo.url if ch.logo else "", 
-                        ch.name
-                    ))
-                
-                def channel_sort_key(item):
-                    num_str = item[0].lstrip("#")
-                    self.logger.info(f"TMS: Sorting channel number {num_str}")
-                    try:
-                        return float(num_str)
-                    except (TypeError, ValueError):
-                        return 999999
-                
-                active_list.sort(key=channel_sort_key)
-                self.active_streams = active_list[:15] 
+                    active_list.append((f"#{display_number}", ch.logo.url if ch.logo else "", ch.name))
+                active_list.sort(key=self._channel_sort_key)
+                active_list = active_list[:15]
 
-            # Detect change
+            if active_list:
+                # Something watchable is on elsewhere -> show those channels.
+                self.active_streams = active_list
+                self._current_uuids = active_uuids
+            else:
+                # Nothing else is watchable right now (e.g. during a failover every
+                # active channel is itself on the placeholder, or nothing is on at
+                # all). Fall back to a directory of the channels this plugin manages
+                # so the grid is never empty.
+                self.active_streams, self._current_uuids = self._get_directory_fallback(tms_url)
+
+            # Detect change. The signature differentiates active vs directory vs empty.
             has_changed = self._current_uuids != PillowImageGen._last_active_uuids
             return has_changed
             

@@ -201,11 +201,30 @@ class Plugin:
         HOST, PORT = TooManyStreamsConfig.get_host_and_port()
         image_to_use = config.tms_image_path
 
+        # These must run in EVERY process that loads the plugin: Channel.get_stream
+        # and the ts_proxy.stream_manager logger can fire in the web process and in
+        # Celery workers alike.
         TooManyStreams.install_get_stream_override()
         TooManyStreams.install_stream_manager_log_filter()
 
+        # The HTTP server, however, must be hosted by exactly ONE process. The plugin
+        # is discovered/instantiated in the web (daphne) process AND in every Celery
+        # worker. Celery workers are ephemeral (--autoscale=6,1 recycles them), so a
+        # server bound there silently dies when the worker is recycled -> :1337 goes
+        # dead and failover hits a refused port. Only host in the long-lived web
+        # process. (The monkey-patches above still run everywhere.)
+        if not self._should_host_server():
+            logger.info("Too Many Streams: not hosting the stream server in this worker process.")
+            self.initialized = True
+            return
+
         if not self._can_bind(HOST, PORT):
-            logger.error(f"Too Many Streams: Could not bind to {HOST}:{PORT}. Port might be in use.")
+            # Expected when more than one web worker loads the plugin: another worker
+            # already owns the port. This is normal, not an error.
+            logger.info(
+                f"Too Many Streams: {HOST}:{PORT} already served by another process; not starting a second server."
+            )
+            self.initialized = True
             return
 
         if not TooManyStreams.check_requirements_met():
@@ -217,9 +236,22 @@ class Plugin:
             kwargs={"host": HOST, "port": PORT},
             daemon=True,
         ).start()
-            
+
         self.initialized = True
         logger.info("Too Many Streams plugin initialized.")
+
+    @staticmethod
+    def _should_host_server() -> bool:
+        """Only the long-lived web process should host the :1337 server.
+
+        Returns False for Celery worker/beat processes (ephemeral, recycled by
+        --autoscale), so the server isn't bound where it would later vanish and
+        leave the placeholder dead. The get_stream override + log filter are
+        still installed in those processes.
+        """
+        argv = sys.argv or []
+        is_celery = any(("celery" in arg) or ("beat" in arg) for arg in argv)
+        return not is_celery
 
     @staticmethod
     def _can_bind(host, port) -> bool:
