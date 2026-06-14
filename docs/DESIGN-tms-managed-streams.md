@@ -1,396 +1,338 @@
-# Too Many Streams — Multi Managed-Stream Redesign (Final)
+# Too Many Streams — Multi Managed-Stream Redesign (v2, "always card then switch")
 
-> Design document produced 2026-06-14. Generalizes the single hardcoded "Too Many
+> Design doc, revised 2026-06-14. Generalizes the single hardcoded "Too Many
 > Streams" card into a registry of configurable **dynamic** and **static** managed
-> placeholder streams (including a new "Starting up" card). Grounded in verified
-> Dispatcharr internals and hardened by a 5-lens adversarial review (54 issues, 29
-> blocker/major). The review **reversed the earlier "always card then switch"
-> decision** — see §1 and the Open Questions.
+> placeholder streams, and adds a **"TMS: startup stream"** shown on every fresh
+> tune while a background probe live-switches the channel to the first healthy
+> real source.
+>
+> **All code citations are verified against the deployed box: Dispatcharr `0.21.1`,
+> `apps.proxy.ts_proxy` namespace.** (An earlier multi-agent pass hallucinated a
+> "v0.26.0 / `live_proxy`" tree with wrong line numbers; those were discarded and
+> every load-bearing fact below was re-read from the running container.)
+
+---
+
+## Decisions locked in
+
+- **D1 — Trigger model = "ALWAYS card then switch."** Every fresh tune shows the `startup` card immediately; a background probe (web/serving process only) finds the first healthy real source and live-switches to it. A **known-good fast-path** lets warm channels skip the card and connect direct, so the card is in practice only paid by cold/unknown tunes.
+- **D2 — The startup card is a real `ChannelStream` membership row at order 9998** on all channels (just above the dynamic `tms` card at 9999), made safe by the selection loop hard-excluding all managed-card stream ids. Visible/queryable in the channel UI; apply/remove parity with the existing card.
+
+**The "slot leak" blocker that earlier review raised is FALSE** — see §9. `Channel.release_stream()` is the verified DECR owner. The real, subtler hazard is a *double*-INCR via the switch path, which §3.4 closes by ordering.
 
 ---
 
 ## Executive summary
 
-This redesign generalizes the plugin's single hardcoded "Too Many Streams" card into a **registry of managed placeholder streams** with two kinds: DYNAMIC (the existing live grid, key `tms`) and STATIC (a new, opt-in "Starting up" card, key `startup`). One HTTP server on `:1337` routes all cards by path; each card has its own lazy ffmpeg encoder; static cards drop the updater thread so they are strictly cheaper. Every card is fully UI-configurable and the startup card is apply/removable fleet-wide via plugin actions, exactly like today's card.
+Today the plugin hardcodes one placeholder card. This redesign introduces a **registry of managed placeholder streams** of two kinds — DYNAMIC (the existing live grid, key `tms`) and STATIC (the new "Starting up" card, key `startup`). One HTTP server on `:1337` routes all cards by path; each has its own lazy `-re` encoder; static cards drop the updater thread (strictly cheaper). Every card is UI-configurable and the startup card is fleet apply/removable.
 
-The headline mechanism change forced by adversarial review: the original "always show card, then probe-and-switch" model is **abandoned as the default** because it (a) permanently leaks a `profile_connections` slot on every switch — there is verifiably no DECR anywhere in the codebase, release is Dispatcharr's job and it never learns of the probe's manual INCR; (b) regresses every healthy tune with a card-encode + downstream nvenc + rebuffer; and (c) breaks the order-iterating selection loop when the card sits at order 0. The finalized model is **"real-source-first, card-on-failure"**: the override selects a real stream as today, and the startup card is shown only when selection fails or a fast health gate flags the top source as known-bad — zero regression for healthy channels, no manual slot accounting, and no order-0 trap. Strictly additive: prod Stream id 195362, `/stream.ts`, and ~2806 memberships are untouched.
+Per your decisions, v1 ships **always-card-then-switch**: the `get_stream` override returns the `startup` card immediately on a fresh tune, a web-process probe health-checks the real sources, reserves the chosen profile, and calls `ChannelService.change_stream_url` to live-switch the channel to it. Slot accounting is **leak-free** because Dispatcharr's `Channel.release_stream()` (models.py:533) decrements `profile_connections` on every teardown, keyed off exactly the `channel_stream`/`stream_profile` keys the switch writes. The one genuine hazard — `update_url`→`update_stream_profile` (stream_manager.py:1083 → models.py:651) performing a *second* INCR — is neutralized by writing the reservation keys **before** the switch so `update_stream_profile` early-returns. A **known-good fast-path** keeps warm tunes byte-identical to today; a `tms:card_inflight` cap bounds the downstream NVENC-session load during failover waves. Strictly additive: prod Stream id 195362, `/stream.ts`, and ~2806 memberships are untouched; startup ships opt-in.
 
 ---
 
-## Open questions / decisions for the user
+## Open questions / decisions for you
 
-- **Startup trigger model (the biggest decision).** The earlier "always card then probe-and-switch" choice is shown by review to leak a connection slot per switch (no DECR exists; Dispatcharr releases only what *it* reserved, and the channel was started on the unlimited card so nothing real was reserved to release), and to regress every healthy tune. **Recommended default: "real-first, card-on-failure"** — the override picks a real source exactly as today; the startup card replaces only the *failure* states (no free slot, or top source flagged bad by a cheap async health gate). This keeps healthy tunes glitch-free, requires no manual `profile_connections` mutation, and avoids the order-0 trap. If you insist on "always card," it can be specified but only with a verified teardown-DECR owner identified first (currently unproven → guaranteed leak).
-- **Does the live switch ever happen at all in v1?** With "real-first," the only place a switch is needed is recovering a channel *already* parked on the card when a real source frees up. **Recommended: defer the live `change_stream_url` switch entirely in v1** — a card-parked channel recovers naturally on the viewer's next re-tune (or a short card-session TTL forces re-selection). This removes the single most dangerous code path (out-of-band INCR + cross-identifier switch + non-owner pubsub ordering) from the first shippable version.
-- **Startup card placement / order.** Order-0 actively fights the selection loop and becomes a permanent trap if the override is ever absent. **Recommended: do NOT add a membership row at all for `startup`; serve it purely as an override return value (programmatic), like the `tms` maxed-branch.** If apply/remove parity and channel-UI visibility are required, place it at a *high* order (e.g. 9998, just above `tms`) and have the loop hard-exclude all registry card stream-ids. Recommended default: programmatic-only (no membership), with a visibility note.
-- **Health gate / fast-path.** Review shows the cache is near-useless for sparsely-tuned channels (cold at 45s TTL) and that a live byte-probe consumes a real provider connection slot, risking account-level bans on a failover wave. **Recommended: make the health gate optional, default OFF in v1**; when on, it is a *capacity-aware* check (read `profile_connections` before any network call) with a per-`m3u_account` concurrency semaphore and a longer ok-TTL.
-- **`is_streams_maxed` refactor.** It currently mutates membership and *stops channels*. **Recommended: refactor to a pure read**; membership is owned solely by apply/remove/reconcile.
-- **`tms_enabled` kill-switch vs 2806 live memberships.** **Recommended: when `tms_enabled=0`, the override skips the card branch (falls through to a graceful 503) rather than the server 404-ing `/stream.ts` mid-stream;** block disabling-while-applied in the UI help text.
-- **Single source of truth for plugin metadata.** `plugin.py` and `plugin.json` duplicate all fields/actions and already drift (v2.1.3 vs v2.2.3). **Recommended: generate `plugin.json` from a single field-spec list at build time**; at minimum, reconcile versions and edit both in lockstep.
-- **Probe in Celery.** Daemon threads die without running `finally` on worker recycle. **Recommended: never spawn probes/health work in Celery; only the web process does it** (and only if any health gate is enabled at all).
-- **Stream-row purge on uninstall.** **Recommended: leave rows (cheap, instant re-apply);** offer a separate explicit "purge" action. Deleting id=195362 is irreversible.
-- **Hourly reconcile beat task.** **Recommended: ship the manual action; make the beat task opt-in** (Celery here is ephemeral).
-- **Cross-key image dedup / user-defined cards.** **Recommended: both deferred** — confirm acceptable.
+The two big forks (trigger model, placement) are decided (D1/D2). Remaining knobs, each with a recommended default:
+
+- **`probe_mode` default.** `capacity_only` (no upstream network probe — just reserve the first source with a free slot; default, safest for provider-ban risk) vs `byte_probe` (open the real URL, require sustained bytes). **Recommended: `capacity_only` in v1**, `byte_probe` behind the fleet-global per-account cap in Phase 6.
+- **Known-good fast-path default.** ON (warm channels skip the card; the main lever against per-tune cost) vs OFF (literal "always card"). **Recommended: ON.**
+- **`tms:card_inflight` cap value.** Caps concurrent card-served channels to bound downstream NVENC sessions; beyond it the override returns a graceful 503 instead of parking. **Recommended: default to a conservative number (e.g. 6) on a single consumer GPU; expose as a file-only override.**
+- **`is_streams_maxed` refactor to a pure read** — required precondition (it currently stops channels). **Recommended: yes.**
+- **`tms_enabled=0` behaviour** with live memberships — override skips the card branch → graceful 503, not a mid-stream 404. **Recommended: yes.**
+- **plugin.json single source** — generate from a Python field-spec at build time; reconcile the 2.1.3/2.2.3 skew. **Recommended: yes.**
+- **Stream-row purge on uninstall** — leave rows (instant re-apply); separate explicit purge action. **Recommended: leave.**
+- **Reconcile beat task** — ship the manual action; beat opt-in (Celery is ephemeral). **Recommended: manual + opt-in beat.**
 
 ---
 
 ## 1. Overview & goals
 
-Today the plugin hardcodes exactly one placeholder "card" (the dynamic "Too Many Streams" grid). This redesign generalizes that single hardcoded identity into a **registry of configurable managed placeholder streams**, supporting two kinds:
+- **DYNAMIC streams** — re-rendered on content change. The existing TMS grid (active-channels, directory fallback) is the built-in `tms`.
+- **STATIC streams** — a fixed configurable image/message. The new `startup` ("TMS: startup stream") is shown on every fresh tune (D1) while the probe finds a real source.
 
-- **DYNAMIC streams** — re-rendered when content changes. The existing TMS card (live grid of currently-active channels, with a directory fallback) is the built-in dynamic stream `tms`.
-- **STATIC streams** — a fixed, configurable image/message. A new built-in static stream `startup` ("TMS: startup stream") is shown when a channel cannot immediately deliver a real source.
+**Goals:** (1) every managed stream UI-configurable; (2) startup fleet apply/removable like the existing card; (3) strictly additive / zero-break for existing installs (Stream 195362, `/stream.ts`, ~2806 order-9999 rows untouched; startup opt-in); (4) one `:1337` server, one hosting process, lazy per-card encoders; (5) room for a 3rd card with minimal code.
 
-**Goals:**
+**Why "always card" is viable (the three former blockers, resolved):**
+- **Slot leak — disproven (§9).** `release_stream` (models.py:533) is the DECR owner; the switch's manual INCR is balanced by it.
+- **Double-INCR via the switch — real, neutralized (§3.4.5).** `update_url`→`update_stream_profile` INCRs unless the reservation keys are written first; we order them so it early-returns.
+- **Healthy-tune regression — mitigated.** Always-card adds a card encode + downstream nvenc + a card→real rebuffer to every *cold* tune; the known-good fast-path removes it for warm channels. No relief during a fleet-wide failover wave — that case is bounded by a concurrent-card cap (§5), not the fast-path.
+- **Order-0 trap — avoided.** The card sits at order **9998**, never 0, and the loop hard-excludes all `card_stream_ids()`.
 
-1. Every managed stream is **user-configurable** (text, image, colours, behaviour, enable/disable) via the plugin UI.
-2. The startup stream is **apply-able to ALL channels and removable** via plugin actions, exactly like the existing TMS card.
-3. **Strictly additive / zero-break** for existing installs: the dynamic card (Stream id 195362, `/stream.ts`, ~2806 channel memberships at order 9999) keeps working untouched; the startup stream defaults to disabled & un-applied (opt-in).
-4. One HTTP server on `:1337` serves all managed streams (routed by path); one hosting process; lazy per-card encoders.
-5. The architecture leaves room for a 3rd+ managed stream with minimal new code.
+**Known limitations (accepted):** a single shared encoder/image per card key cannot show per-channel state; "always card" is literal only for cold/unknown channels (the fast-path intentionally bypasses warm ones).
 
-**Trigger-model decision (revised from the draft).** The draft's "always show the startup card on every tune, then probe and live-switch to a healthy real source" is **withdrawn as the default.** Adversarial review established three independently fatal problems, each verified against the code:
+## 2. Current state (verified, 0.21.1)
 
-- **Slot leak (blocker).** There is **no `DECR` of `profile_connections` anywhere in the plugin or, per grounding, in `change_stream_url`.** Release is Dispatcharr's teardown job, keyed off the channel's *own* reservation. On a fresh tune the channel starts on the startup card (profile 1, unlimited, **no INCR**). A probe that manually `INCR`s a *real* profile creates an increment that teardown will never match → **one permanently leaked slot per startup-switched channel**, eventually saturating `max_streams` and wedging real playback. No teardown-DECR counterpart could be identified, so the manual reservation is a guaranteed leak.
-- **Healthy-tune regression (major).** The card is transcoded twice (plugin libx264, then the downstream proxy ffmpeg — universally nvenc on prod) on **every** tune, adds cold-start latency to the hot path, and forces a client-visible rebuffer (card→real input re-init) on every healthy tune, where today a healthy channel tunes straight through.
-- **Order-0 trap (major).** The selection loop reserves the first order-sorted stream with a free profile slot and **does not exclude managed cards**; a card at order 0 on profile 1 (unlimited) always wins → every applied channel sticks on the card.
+- **`src/StreamServer.py`** — serves ONE MPEG-TS card on `0.0.0.0:1337` (`/`, `/stream.ts`). Single shared lazy ffmpeg encoder (`-re -loop 1 -framerate 1 -i IMG -re -f lavfi -i anullsrc ... libx264 -preset ultrafast -tune stillimage -threads 1 ... -f mpegts pipe:1`). `_ensure_running` on first client; idle-stop 60s after last. Broadcaster fans stdout to per-client 50-deep drop-on-full queues. **Updater builds a NEW `PillowImageGen()` each iteration and relies on the process-global class attr `_last_active_uuids` to suppress re-encodes.** Fixes preserved: `-re`, `-threads 1`, reap-after-kill.
+- **`src/PillowImageGen.py`** — 1920×1080 JPG. `get_active_streams()` SCANs `ts_proxy:channel:*:metadata`, builds the OTHER-active grid (excludes only the `tms` URL today), directory fallback (DB-ordered by indexed `channel_number`, capped 15), else "This Channel is Unavailable". Change-detection vs the class-global `_last_active_uuids`.
+- **`src/TooManyStreams.py`** — `Channel.get_stream` override: (1) restore `channel_stream:{int id}`/`stream_profile:{sid}`; (2) iterate `self.streams` by `channelstream__order`, reserve first free-slot profile (`INCR profile_connections:{P}` only if `max_streams>0`), set keys, return; (3) maxed branch returns the card (dead on prod). **`is_streams_maxed` is NOT pure — it calls `remove_stream_from_channel` which `stop_channel`s.** Card identity `Stream(name='TooManyStreams', url=get_stream_url())`.
+- **`src/TooManyStreamsConfig.py`** — `get_config()` merges defaults < DB < persistent file < env; **`save_plugin_persistent_config` does raw `json.dump` (bypasses `from_dict`/`dict()`).** `get_stream_url()`→`/stream.ts`.
+- **`plugin.py`** — `Plugin` (`version="2.1.3"`), 12 flat `fields[]`, 4 `actions[]`; installs override + log filter everywhere, hosts the server in one non-celery web process (`_should_host_server`+`_can_bind`); **fire-and-forget server thread (no reference kept); `run()` dispatches on action-id only.**
+- **`plugin.json`** — duplicates all fields/actions; **version skew 2.2.3 vs 2.1.3** (already drifting).
 
-**Finalized model: "real-source-first, card-on-failure."** The override selects a real stream exactly as it does today. The startup card is returned **only** when real selection cannot immediately succeed (no free slot, or an *optional, default-off* health gate flags the top candidate as known-bad). This is **zero-regression for healthy channels**, requires **no manual `profile_connections` mutation** (the card uses profile 1 / unlimited, which never INCRs and never needs release), and never places a card where the order loop can mis-select it. The live `change_stream_url` switch and the out-of-band probe-reservation — the riskiest paths — are **deferred out of v1** (see §3.4); a card-parked channel recovers on the next re-tune or via a short card-session TTL.
-
-**Known limitations (accepted):**
-- A single shared encoder/image per card key **cannot show per-channel state** — one channel "starting" while another shows "unavailable" cannot both render on one shared image. The redesign makes the two *states* into two distinct *cards* on distinct routes (`startup` vs `tms`), which is the right granularity; within a single key it remains one shared image, as today.
-- The startup card is a distinct failure-state surface, not a guarantee that any given tune is instant; "instant card on every tune" is explicitly **not** a goal of the finalized model.
-
-## 2. Current state (verified recap)
-
-- **`src/StreamServer.py`** — serves ONE MPEG-TS card on `0.0.0.0:1337` (`do_GET` accepts `/` and `/stream.ts`, else 404). Single shared LAZY ffmpeg encoder (`-re -loop 1 -framerate 1 -i IMG.jpg -re -f lavfi -i anullsrc ... libx264 -preset ultrafast -tune stillimage -threads 1 ... -f mpegts pipe:1`; nvenc/qsv branches present). Started on first client (`_ensure_running`), idle-stopped 60s after the last client (`IDLE_SHUTDOWN_GRACE`). Broadcaster fans encoder stdout into per-client 50-deep drop-on-full queues, reading `1316*16` bytes. **The updater constructs a NEW `PillowImageGen()` every loop iteration** and relies on the **process-global class attr `_last_active_uuids`** surviving across those instances to suppress re-encodes; on change it calls `_start_ffmpeg`. Default image: `img/too_many_streams2.jpg`. Hard-won fixes preserved: `-re` pacing, `-threads 1`, reap-after-kill, "restart only if still current and still watched". `do_GET` warms the encoder for **both** `/` and `/stream.ts`.
-- **`src/PillowImageGen.py`** — renders 1920×1080 JPG. `get_active_streams()` SCANs `ts_proxy:channel:*:metadata`, filters valid UUIDs, builds an OTHER-channels grid via `ChannelStatus.get_basic_channel_info`, **excludes channels whose `info["url"] == get_stream_url()` — i.e. only the `tms` URL**; falls back to a directory of channels with the `tms` card applied (DB-ordered by indexed `channel_number`, capped 15); else "This Channel is Unavailable". Change-detection compares `self._current_uuids` to the **class-global `_last_active_uuids`**. Default render file `too_many_streams.jpg`; logo cache `/tmp/tms_logos`.
-- **`src/TooManyStreams.py`** — `Channel.get_stream` override: (1) restore from `channel_stream:{self.id}` (**integer PK**) / `stream_profile:{stream_id}`; (2) iterate `self.streams.all().order_by("channelstream__order")`, reserve first profile with a free slot — `INCR profile_connections:{P}` only when `max_streams>0`, **no DECR anywhere**; write Redis keys; return `(stream.id, profile.id, None)`; (3) maxed branch returns `(custom_stream.id, None, None)` (dead on prod per grounding). `apply_to_all_channels()` is N+1. **`is_streams_maxed` is NOT pure: it calls `add_stream_to_channel` when true and `remove_stream_from_channel` when false — the latter STOPS the channel** (`ChannelService.stop_channel` + `proxy_server.stop_channel`). Identity: `Stream.objects.filter(name='TooManyStreams', url=get_stream_url())`.
-- **`src/TooManyStreamsConfig.py`** — `get_config()` seeds **only 4 keys** (title/description/cols/log_level), then layers DB `settings`, then the persistent **file (overrides DB)**, then a small env override; caches a `PluginConfig`. **`save_plugin_persistent_config` does raw `json.dump(settings)` — it never constructs `PluginConfig` and never calls `dict()`.** `get_stream_url()` → `http://127.0.0.1:1337/stream.ts`. `get_host_and_port()` reads `TMS_HOST`/`TMS_PORT` env.
-- **`src/schemas.py`** — `PluginConfig` dataclass; `from_dict` is hand-written field-by-field; `dict()` is `asdict`. No `schema_version`.
-- **`plugin.py`** — `Plugin` (`version="2.1.3"`), flat `fields[]` (12), `actions[]` (4). `initialize()` installs override + log filter in EVERY process; hosts `StreamServer` in exactly one non-celery web process (`_should_host_server` + `_can_bind` precheck — TOCTOU between precheck and bind, handled only by catching `OSError`). **The host does NOT keep a reference to the `StreamServer` (fire-and-forget thread).** `run()` dispatches solely on the action-id string; **no `key`/params plumbing**.
-- **`plugin.json`** — **duplicates all 12 fields and 4 actions verbatim** and is shipped by `build.sh`. **Version skew: `plugin.json` is `2.2.3`, `plugin.py` is `2.1.3`** — proof the two are hand-maintained and already drift.
-- **`build.sh`** — `cp -r src` (new subpackages picked up automatically *if they have `__init__.py`*), `cp plugin.json`, deletes the stale zip before rebuilding.
-
-**Verified Dispatcharr internals (authoritative):** card is `Stream id=195362, is_custom=true, m3u_account_id=1, stream_profile_id=NULL`; account 1 profile id=1 (`is_default, is_active, max_streams=0`=UNLIMITED). `generate_stream_url` requires truthy `stream_id` AND `profile_id` (else 503). `change_stream_url` does NOT touch `profile_connections` in either owner (`manager.update_url` in place) or non-owner (pubsub) path; with `new_url` passed it is used directly. `get_stream` runs in web AND celery.
+**Verified Dispatcharr internals (0.21.1, `ts_proxy`):**
+- Card = `Stream id=195362, is_custom, m3u_account_id=1`; account 1 profile `id=1, is_default, is_active, max_streams=0` (UNLIMITED). Returning `(195362, 1, None)` is served by `generate_stream_url` (which requires truthy stream_id AND profile_id — url_utils.py:86).
+- `Channel.get_stream` reserves via atomic `_check_and_reserve_profile_slot` (INCR-then-check-rollback; max_streams=0 ⇒ no INCR).
+- `Channel.release_stream()` (models.py:533): DECRs `profile_connections` on teardown — PRIMARY via `channel_stream:{int}`→`stream_profile:{sid}` (DECR ~627), FALLBACK via metadata hash `ts_proxy:channel:{uuid}:metadata` fields `STREAM_ID`/`M3U_PROFILE` (DECR ~580); HDEL/DELETE guard double-release. Called on every teardown path (views ×4, server ×2, channel_service `stop_channel`, stream_generator).
+- `Channel.update_stream_profile(P)` (models.py:651): pipeline DECR-old / SET `stream_profile:{sid}=P` / **INCR `profile_connections:{P}`**; early-returns if current==new or if `stream_profile:{sid}` absent.
+- `ChannelService.change_stream_url(channel_id=UUID, new_url, user_agent, target_stream_id, m3u_profile_id)` (channel_service.py:88): owner ⇒ `manager.update_url(new_url, sid, pid)` (stream_manager.py:1060); non-owner ⇒ Redis pubsub to owner. Calls `_update_channel_metadata` (writes `STREAM_ID`/`M3U_PROFILE`). With `new_url` it does not re-select a profile.
+- `StreamManager.update_url` (stream_manager.py:1060): if `current_stream_id != stream_id` and `m3u_profile_id` given ⇒ **calls `channel.update_stream_profile(m3u_profile_id)` (line 1083)**.
+- `get_alternate_streams(channel_id, current_stream_id)` (url_utils.py:279, used by views.py:269/289): the proxy's **autonomous failover** — picks alternates with available `profile_connections` and can switch a stalled stream on its own.
+- Identity: `channel_stream`/`stream_profile`/`profile_connections`/`tms:*` guard keys use the channel **integer PK**; `change_stream_url`/metadata/liveness use the channel **UUID**. `proxy_server.check_if_channel_exists(uuid)` is the liveness primitive.
 
 ## 3. Proposed architecture
 
-A single **registry** of `ManagedStream` definitions is the source of truth that drives: the Dispatcharr `Stream` rows, HTTP routing in `StreamServer`, which renderer runs per path, channel application/order, and the `get_stream` override's per-key branching.
+A single **registry** of `ManagedStream` definitions is the source of truth driving Stream rows, HTTP routing, renderers, channel application, and the override's per-key branching.
 
 ### 3.1 Managed-stream model & registry
 
-A `ManagedStream` is a pure-data **definition** plus a resolved runtime `stream_id`. It owns no threads and does no I/O at construction. The `renderer`/`behavior` config is an opaque-to-the-registry **dict** (different kinds need different shapes).
-
 ```python
 # src/managed_streams/definition.py
-class StreamKind(str, Enum):
-    DYNAMIC = "dynamic"
-    STATIC  = "static"
+class StreamKind(str, Enum): DYNAMIC="dynamic"; STATIC="static"
 
 @dataclass
 class ManagedStream:
-    key: str                       # "tms", "startup" -> registry id, URL slug, Redis namespace
+    key: str                       # "tms","startup" -> registry id, URL slug, Redis ns
     display_name: str
     stream_name: str               # exact Dispatcharr Stream.name for get_or_create
     http_path: str                 # canonical served path, e.g. "/tms/startup.ts"
     kind: StreamKind
     m3u_account_id: int = 1
-    apply_order: Optional[int] = None   # None => NOT added as a ChannelStream (programmatic-only)
+    apply_order: Optional[int] = None
     is_custom: bool = True
-    stream_profile_id: Optional[int] = None
-    stream_url_path: Optional[str] = None   # override the URL stored in the Stream row
+    stream_url_path: Optional[str] = None
     enabled: bool = True
     builtin: bool = True
     legacy_paths: tuple = ()
     renderer: dict = field(default_factory=dict)
     behavior: dict = field(default_factory=dict)
     stream_id: Optional[int] = field(default=None, compare=False)
-
-    def stored_url(self, host, port) -> str:
-        path = self.stream_url_path or self.http_path
-        h = "127.0.0.1" if host == "0.0.0.0" else host
-        return f"http://{h}:{port}{path}"
-    def all_paths(self) -> tuple: return (self.http_path, *self.legacy_paths)
-    def redis_ns(self) -> str: return f"tms:ms:{self.key}"
+    def stored_url(self, host, port): ...
+    def all_paths(self): return (self.http_path, *self.legacy_paths)
 ```
 
-**Back-compat URL encoding.** `tms` keeps stored `Stream.url=/stream.ts` (`stream_url_path="/stream.ts"`) and lists `/stream.ts` + `/` in `legacy_paths`; new defs get clean `/tms/<key>.ts` URLs. The two built-ins:
+Built-ins: `tms` (DYNAMIC, `stream_url_path="/stream.ts"`, `legacy_paths=("/stream.ts","/")`, `apply_order=9999`, enabled) and `startup` (STATIC, `http_path="/tms/startup.ts"`, **`apply_order=9998`**, `enabled=False`, `behavior={"mode":"always_card","fast_path":True,"probe_mode":"capacity_only"}`).
 
-```python
-# src/managed_streams/builtins.py
-def _builtin_defs():
-    return [
-        ManagedStream(
-            key="tms", display_name="Too Many Streams (dynamic grid)",
-            stream_name="TooManyStreams", http_path="/tms/tms.ts",
-            stream_url_path="/stream.ts", legacy_paths=("/stream.ts", "/"),
-            kind=StreamKind.DYNAMIC, apply_order=9999, builtin=True, enabled=True,
-            renderer={...}, behavior={"mode": "maxed_fallback"},
-        ),
-        ManagedStream(
-            key="startup", display_name="Starting up",
-            stream_name="TMS: startup stream", http_path="/tms/startup.ts",
-            kind=StreamKind.STATIC,
-            apply_order=None,            # programmatic-only by default (see 3.6 / OQ)
-            builtin=True, enabled=False, # opt-in
-            renderer={...},
-            behavior={"mode": "first_failure",  # FINALIZED model, not "always_then_probe"
-                      "health_gate_enabled": False,  # default OFF (review-driven)
-                      "card_session_ttl_sec": 20},
-        ),
-    ]
-```
-
-**`ManagedStreamRegistry`** — process-wide singleton, lazy `_load()`, `reload()` (called by `TooManyStreamsConfig.clear_cache()`). Accessors drive every other lane: `all() / enabled() / get(key) / by_path(path) / by_stream_id(id) / card_stream_ids() / refresh_event(key)`. `card_stream_ids()` returns the set of all registry Stream ids and is the **single source** the override loop uses to exclude managed cards.
-
-```python
-def get_or_create_stream(self, ms):
-    host, port = TooManyStreamsConfig.get_host_and_port()
-    url = ms.stored_url(host, port)
-    row, _ = Stream.objects.get_or_create(
-        name=ms.stream_name, url=url,
-        defaults=dict(is_custom=ms.is_custom, channel_group=None,
-                      stream_profile_id=ms.stream_profile_id))
-    ms.stream_id = row.id
-    return row
-```
-
-**Atomicity caveat (review-driven):** `get_or_create` is only race-free against a DB unique index. The codebase does **not** confirm a unique constraint on `Stream(name, url)`. We therefore treat `get_or_create` as **best-effort**; it remains strictly better than the current get-then-create, and is back-compatible because `(name="TooManyStreams", url="/stream.ts")` matches the prod row **for the default host/port only**. **Host/port coupling:** `Stream.url` embeds host:port; an install with a non-default `TMS_PORT`/`TMS_HOST` already has a different stored URL and would get a *second* row on upgrade — this fragility exists today and is documented, not introduced. Recommendation: document that `TMS_HOST`/`TMS_PORT` must be stable across upgrades.
-
-| Today | After |
-|---|---|
-| `TooManyStreams.STREAM_NAME` | `registry.get("tms").stream_name` |
-| `get_or_create_stream()` | `registry.get_or_create_stream(registry.get("tms"))` |
-| `get_stream_url()` | `registry.get("tms").stored_url(...)` (kept as back-compat shim) |
-| global `REFRESH_SIGNAL` | `registry.refresh_event(key)` per dynamic key |
-| single-path `StreamServer` | one `StreamServer` routing all `enabled()` paths |
-| (none) | `registry.card_stream_ids()` — loop exclusion set |
+`ManagedStreamRegistry` — process singleton, lazy load, `reload()` (from `clear_cache()`). Drives everything via `all()/enabled()/get(key)/by_path()/by_stream_id()/card_stream_ids()/refresh_event(key)`. **`card_stream_ids()`** (frozenset of all registry Stream ids) is the single source for the loop exclusion. `get_or_create_stream(ms)` resolves the Stream row (best-effort; back-compatible for the default host/port — non-default `TMS_HOST`/`TMS_PORT` risks a duplicate row, documented).
 
 ### 3.2 StreamServer (multi-stream HTTP + encoders)
 
-Split into:
+Split into `ManagedStreamChannel` (one card's lazy encoder + broadcaster, + updater for dynamic only) and `StreamServer` (one `ThreadingHTTPServer` on `:1337`, a `dict[key→channel]`, routing, `reload()`).
 
-- **`ManagedStreamChannel`** — owns ONE card's lazy encoder + broadcaster (+ updater for dynamic only); today's `StreamServer` body minus the HTTP server, parameterised by a `ManagedStream`. All hard-won behaviour preserved per card verbatim.
-- **`StreamServer`** — owns the single `ThreadingHTTPServer` on `0.0.0.0:1337`, a `dict[key -> ManagedStreamChannel]`, routing, and `reload()`.
-
-**Routing — resolves against `enabled()` only (so disabled keys 404 without warming an encoder):**
-
-| Path | Resolves to | Notes |
-|---|---|---|
-| `/healthz` | 200 `ok` | matched FIRST, before the `/` alias; warms no encoder (dead-`:1337` self-check) |
-| `/stream.ts`, `/` | `tms` (if enabled) | back-compat aliases; **404 if `tms` disabled** |
-| `/tms/<key>.ts` | `<key>` (if enabled) | strict `^/tms/([a-z0-9_]{1,32})\.ts$`; disabled/unknown ⇒ 404 |
-| anything else | 404 | |
-
-**Encoder freshness:** `_get_ffmpeg_cmd` today re-reads `config.video_encoder` live at each encoder start. After the split, `video_encoder` is **snapshotted at `ManagedStreamChannel` construction**; an encoder change takes effect on `reload()`. The carry-over predicate (below) **includes `encoder`**, so an encoder edit *does* rebuild the channel.
-
-**dynamic vs static** differ only in lifecycle around the image (ffmpeg command identical):
-- **Dynamic** = encoder + broadcaster + **updater** (re-renders on active-set change → one-discontinuity restart; blocks on the per-key refresh `Event` when idle). 3 threads warm.
-- **Static** = encoder + broadcaster, **no updater** (image never changes ⇒ no Redis/DB polling, no re-render). 2 threads warm. User image fed directly (Pillow bypassed); else rendered once into the per-key file and treated immutable.
-
-**`reload()`** rebuilds the dict; removed/disabled cards `shutdown()`; warm cards whose **`key`+`kind`+`image_path`+`encoder`** are unchanged are carried over (an unrelated edit never bounces an in-use card). **The host MUST keep a reference to the `StreamServer`** (today it is fire-and-forget) and `reload()` is a **no-op in non-hosting workers** (they hold no server). **Cross-process ordering invariant (review-driven):** because `get_stream` returns card ids in *all* processes but only the host serves `:1337`, the host must `server.reload()` to add a new card's route **before** any worker can return that card's id. In v1 this is trivially satisfied: the only new card is `startup`, served at a fixed path that the host binds at startup; enabling it is a config flag that both the registry (everywhere) and the host's server (via `reload`) read from the same persisted config, and the override only returns a `startup` id when `enabled AND` the server already advertises the path. If a worker ever returns a card id whose path the live server doesn't serve, the proxy 503s and retries (no crash).
+Routing resolves against `enabled()` only: `/healthz`→200 (matched before `/`, warms no encoder); `/stream.ts`,`/`→`tms`; `/tms/<key>.ts`→`<key>`; else 404. `video_encoder` is snapshotted per channel (changes apply on `reload()`). **The host keeps a reference to the server** (today it's fire-and-forget); `reload()` is a no-op off-host. **Cross-process ordering invariant:** the host must serve a card's route before any worker returns that card's id — trivially satisfied in v1 (startup's path is bound at startup; the override only returns it when `enabled` and the path is advertised). Static cards have no updater thread.
 
 ### 3.3 Renderers (dynamic vs static)
 
-A `Renderer` interface generalizes today's `PillowImageGen`. Each managed stream gets its own renderer instance, its own output file (`<render_dir>/<key>.jpg`), and **per-instance change-detection state**.
+`Renderer` interface. **Phase-0 blocker fix (coupled):** replace process-global `_last_active_uuids` with an instance `_last_signature` AND make the channel hold ONE long-lived renderer instance across updater iterations (the two are inseparable — splitting regresses the dynamic card). `DynamicRenderer` = today's logic intact, but its self-exclusion must check **all** `card_stream_ids()` (so a startup-card-parked channel never leaks into the grid). `StaticRenderer` renders once (passthrough a user image, or draw a card; corrupt image ⇒ card mode, never black). Output dir `/data/plugins/TMS_Persistent_Config/tms_render/<key>.jpg`.
 
-**Mandatory blocker fix:** replace the **process-global** `PillowImageGen._last_active_uuids` with an **instance** `_last_signature`. **Coupling correction (review-driven):** the current updater creates a *new* `PillowImageGen()` every loop and depends on the class-global surviving across instances. Moving the signature to instance state in isolation would make every updater iteration re-render+restart. Therefore the signature fix is **inseparable from the long-lived-renderer ownership change** — `ManagedStreamChannel`/`RenderManager` must hold ONE renderer instance across iterations. The phased plan (§8) reflects this: the two land **together** in Phase 0, not split across phases.
+### 3.4 Startup runtime flow (always card then switch)
 
-- **`DynamicRenderer`** wraps today's logic intact (`poll()`==`get_active_streams()`, `render()`==`generate()`); changes: per-instance signature, and config read from the per-stream renderer blob.
-- **`StaticRenderer`** renders a fixed card once (re-rendered only on config/mtime/size change; `poll()` does no Redis/DB and returns `False`):
-  - **Passthrough mode** (user `background_image_path`): normalize/letterbox to 1920×1080 JPEG (or `copyfile` if already so) into `out_path`; corrupt/missing ⇒ card mode (never a black screen).
-  - **Card mode**: solid bg + centred title + message + optional static motif. No animation.
+#### 3.4.1 Identifier discipline (where leaks hide)
 
-Shared font/`_hex_to_rgb`/centred-text helpers factor into `src/renderers/draw_utils.py` (no behavioural change to the dynamic path).
+| Concern | Identifier | Key / call |
+|---|---|---|
+| Reservation (restore + reserve) | channel **int PK** `self.id` | `channel_stream:{int}`→sid; `stream_profile:{sid}`→pid |
+| Slot counter | m3u **profile id** | `profile_connections:{P}` |
+| Switch + metadata | channel **UUID** | `change_stream_url(channel_id=UUID)`; metadata `ts_proxy:channel:{uuid}:metadata` |
+| TMS guard keys | channel **int PK** | `tms:starting:{int}`, `tms:switch_inflight:{int}` |
+| Liveness | channel **UUID** | `proxy_server.check_if_channel_exists(uuid)` |
+| Health | **stream id** | `tms:health:{sid}` |
 
-**Self-exclusion deviation (required, review-driven):** today `get_active_streams` excludes only the `tms` URL. With `startup` live, a channel showing the startup card would leak into the dynamic grid. The dynamic renderer's exclusion **must check ALL managed-card URLs/ids** via `registry.card_stream_ids()` / `registry.by_path`, an **explicit deviation from "byte-for-byte."**
+The probe holds the `Channel` (both ids); never derive one from the other via a lookup.
 
-`RenderManager` owns one renderer per enabled key (`render_path / renderer / ensure_initial / reload`), carries over `_last_signature`, writes to the **persistent volume** `/data/plugins/TMS_Persistent_Config/tms_render/<key>.jpg`. **Migration of the existing image:** the dynamic card's first post-upgrade frame is produced by `RenderManager.ensure_initial("tms")` (force-render) into `tms_render/tms.jpg`; the bundled `img/too_many_streams2.jpg` remains the *fallback seed* only if rendering fails, and a user `tms_image_path` continues to be honored exactly as today. Logo cache stays ephemeral at `/tmp/tms_logos`.
-
-### 3.4 Startup runtime flow (real-first, card-on-failure)
-
-The override is generalized but its **healthy path is unchanged**. The normal loop gains **one hard invariant** and the failure branches gain the `startup` card.
-
-**Override ordering (authoritative, finalized):**
+#### 3.4.2 Override ordering (authoritative)
 
 ```
 0. no streams        -> (None, None, "No streams assigned to channel")
-1. restore session   -> channel_stream:{int id} + stream_profile:{sid} present? return them
-2. normal loop       -> iterate self.streams by channelstream__order, EXCLUDING any
-                        stream id in registry.card_stream_ids(); reserve first real
-                        profile with a free slot (INCR only if max_streams>0). UNCHANGED
-                        except the exclusion. (This is the healthy path; zero regression.)
-3a. optional health gate (default OFF) -> if startup active AND the chosen real stream's
-                        top profile is flagged tms:health=="bad" (cheap Redis read, NO
-                        network in the hot path), treat as "no immediate source".
-3b. maxed / no-immediate-source -> if startup is_kind_active(channel):
-                        return (startup_card_id, 1, None)  [profile 1 = unlimited, NO INCR]
-                        write channel_stream:{int id}=startup_card_id,
-                              stream_profile:{startup_card_id}=1, with a SHORT TTL
-                              (card_session_ttl_sec, default 20s) so a later re-tune
-                              re-enters selection instead of restoring the card forever.
-4. tms maxed-out     -> existing dynamic tms card branch (UNCHANGED behaviour), now
-                        reading a PURE is_streams_maxed (membership mutation removed).
+
+1. RESTORE SESSION (first; shared by every concurrent viewer; never INCRs):
+     sid = GET channel_stream:{int id}; pid = GET stream_profile:{sid}
+     if sid and pid:
+        if sid in card_stream_ids():
+            return (sid, pid, None) IF EXISTS tms:starting:{int id}   # probe owns it
+            else fall through (card key outlived its probe -> re-arm)
+        else return (sid, int(pid), None)                            # real switched target
+
+2. KNOWN-GOOD FAST-PATH (default ON; kills the healthy-tune regression):
+     top = first self.streams EXCLUDING card_stream_ids(), by order
+     if GET tms:health:{top.id} == "ok" AND top.profile has a free slot:
+        reserve top atomically (3.4.4); return real (top.id, P)      # no card/probe/switch
+
+3. ALWAYS-CARD (D1, cold/unknown):
+     if is_kind_active(self, startup):
+        CARD = registry.get("startup").stream_id; PID = 1            # unlimited, no INCR
+        SET channel_stream:{int id}=CARD EX CARD_SESSION_TTL
+        SET stream_profile:{CARD}=1      EX CARD_SESSION_TTL
+        if SET tms:starting:{int id} "<token>" NX EX STARTING_TTL:
+            if in_web_process(): spawn_probe(self, token)            # NEVER celery
+        else: EXPIRE tms:starting:{int id} STARTING_TTL
+        return (CARD, 1, None)
+
+4. NORMAL LOOP (only if startup inactive): iterate by order, `continue` on any
+   id in card_stream_ids(); reserve first free-slot profile atomically (3.4.4).
+
+5. tms maxed-out -> existing dynamic tms branch, reading a PURE is_streams_maxed (§3.6).
 ```
 
-**Why this resolves the blockers:**
-- **No slot leak.** The card is returned with profile 1 (unlimited) ⇒ **no INCR, nothing to release.** The plugin performs **no manual `profile_connections` mutation** anywhere. The only INCR remains the existing normal-loop reservation, which Dispatcharr's teardown already balances exactly as today.
-- **No healthy-tune regression.** Healthy channels take the normal loop and tune straight to the real source — no card, no double-transcode, no switch, no rebuffer.
-- **No order-0 trap.** `startup` is **programmatic-only** (`apply_order=None`, no `ChannelStream` row) — it is returned by the override, never reached by the order loop. The loop additionally **excludes all `card_stream_ids()`** so even the `tms` order-9999 row (and any future card row) can never be mis-selected as a real source.
+`is_kind_active(self, startup)` = `startup.enabled AND startup.stream_id AND self.streams.exclude(id__in=card_stream_ids()).exists()` (must be a real source to switch TO; reuses the loop's queryset, no extra `m3u_account` deref).
 
-**`is_kind_active(channel, ms)`** = `ms.enabled AND` (for programmatic-only startup) `ms.behavior` active. Because `startup` has no membership, "applied to all channels" is expressed as a **global enable flag** plus an optional explicit allow/deny scope; the apply/remove actions toggle that flag (and, if the user opts into membership placement per the OQ, manage rows at a high order with the same exclusion guaranteeing safety). The cheap candidate-existence question ("does this channel have ≥1 real stream?") is answered **without extra DB work** by reusing the same `self.streams` queryset the normal loop already evaluates and subtracting `card_stream_ids()` — no `m3u_account` dereference in the hot path.
+#### 3.4.3 Leak-free accounting (Δ = net `profile_connections:{P}` for the real profile P)
 
-**Card-session lifecycle (review-driven, closes the "stuck on card" bug).** The card session keys get an explicit **TTL** (`card_session_ttl_sec`). This is the critical divergence from today's untTL'd `channel_stream` write: it guarantees a channel parked on the startup card **re-enters selection on the next tune after the TTL**, so a channel whose first attempt found everything maxed automatically retries when a slot frees up — without any live switch, probe, or manual accounting. The `stream_profile:{startup_card_id}=1` orphan is harmless (the card is always profile 1) and also expires.
+| # | Event | Plugin ops | Dispatcharr ops | Δ(P) |
+|---|---|---|---|---|
+| A | Cold tune → card | SET channel_stream=CARD ex; SET stream_profile:CARD=1 ex; SET tms:starting NX | serves card | 0 (profile 1, no INCR) |
+| A′ | Warm tune → fast-path | atomic reserve top (3.4.4) | — | +1 (like today) |
+| B | Probe reserves S/P | atomic INCR pc:{P} (rollback if >max) | — | +1 (0 on rollback) |
+| C | Commit switch | SET channel_stream=S, **SET stream_profile:S=P** (both before switch), DEL stale stream_profile:CARD; (non-owner) HSET metadata STREAM_ID/M3U_PROFILE; `change_stream_url(...)`; PERSIST on success; DEL guards | `update_stream_profile` **no-ops** (current==P, §3.4.5) | 0 |
+| D | Teardown while live on S/P | — | `release_stream` DECR pc:{P} (primary or metadata fallback); DEL/HDEL | −1 |
+| E | Teardown while on card | abort: DEL tms:starting | `release_stream`: stream_profile:CARD=1 → DECR pc:1 only if >0 (benign, unlimited) | 0 |
+| F | Nth concurrent viewer | restore returns existing CARD/S; no write | — | 0 |
+| G | Double release_stream | — | 2nd call: keys gone / metadata HDEL'd → no DECR | 0 |
+| H | Rollback in B | INCR then DECR | — | 0 |
 
-**Deferred to a later phase (explicitly NOT in v1), pending the OQ decision on "always-card":** the out-of-band probe, manual profile reservation, and `change_stream_url` live switch. If proactive recovery of a *currently-parked* channel is later chosen (rather than on re-tune), that feature must first identify a **verified teardown-DECR owner** for any manually-reserved slot, pin the **channel-id identity** for `change_stream_url` (the session keys are integer-PK; the switch identifier must be confirmed, not assumed UUID), bound the **all-inclusive time budget** (`wait_ready + health + reserve-retries + switch < guard_ttl`, extending the guard via `EXPIRE`), add a **per-`m3u_account` probe concurrency semaphore** plus a **capacity precheck before any network probe** (read `profile_connections` first), guard against **daemon-thread death in Celery** (TTL-based self-heal, never rely on `finally`), and define the **non-owner pubsub ordering/ack** and **false-`ok` health poisoning** mitigations.
+Balance: exactly one INCR (B, the plugin) ↔ one DECR (D, `release_stream`). The card is accounting-inert (profile 1 unlimited).
 
-**Optional health gate (default OFF).** When enabled, it is purely a **Redis read** of `tms:health:{stream_id}` in the hot path (no network). The `bad`/`ok` entries are populated by a **separate, web-process-only, capacity-aware, per-account-throttled background check** (never from a Celery daemon thread, never before checking `profile_connections`). A live byte-probe consumes a real provider connection slot and risks account bans on a failover wave, so on an "all maxed" profile the gate **must not probe** — it simply lets the maxed branch show the card. False-`ok` poisoning is mitigated by a stricter ok-criterion (sustained bytes) and a conservative ok-TTL; this is why the gate ships **off by default.**
+#### 3.4.4 The single atomic reservation (fast-path, probe, AND normal loop)
+
+```python
+def reserve_atomic(P, max_streams, r):
+    if max_streams == 0: return True            # unlimited
+    n = r.incr(f"profile_connections:{P}")
+    if n > max_streams:
+        r.decr(f"profile_connections:{P}")      # rollback -> net 0
+        return False
+    return True
+```
+
+Replaces the override's current racy `GET … < max ; SET ; INCR` (over-admits past `max_streams` under a wave). Per-channel single-flight (`tms:starting:{int}` SET NX) ensures only one concurrent tune INCRs; losers restore from the winner's `channel_stream`.
+
+#### 3.4.5 Switch identity, ordering & the `update_stream_profile` correction
+
+**Verified:** `change_stream_url(target_stream_id=S, m3u_profile_id=P)` → `update_url(new_url, S, P)` (stream_manager.py:1060) → `channel.update_stream_profile(P)` (line 1083 → models.py:651), which INCRs `profile_connections:{P}` **unless** its `current==new` guard fires.
+
+**Mandatory ordering (makes it a guaranteed no-op):** write `SET channel_stream:{int}=S` and `SET stream_profile:{S}=P` **strictly before** `change_stream_url`. Then `update_stream_profile` reads `current_profile==P==new` and early-returns — no second INCR. The plugin's manual INCR (B) is the only increment. A runtime assertion (`current_profile==P` pre-switch) and a regression test guard this. (Equivalent alternative: skip the manual INCR and let `update_stream_profile` do the single INCR — but that path also requires `stream_profile:{S}` pre-set and is less robust to the current-profile value; we keep the explicit manual-INCR + no-op approach.)
+
+**Ordering invariant consequences:** a re-entrant `get_stream` reads real `(S,P)` (never re-cards); a mid-switch teardown finds a releasable real reservation; on the non-owner path the plugin writes the metadata hash itself so `release_stream`'s fallback is consistent even though the owner applies the switch asynchronously.
+
+#### 3.4.6 The probe (web/serving process only)
+
+```
+P0 generation: GET tms:starting:{int} token == mine else ABORT("superseded")
+P1 wait-ready (bounded): until proxy_server.check_if_channel_exists(uuid) & state ready;
+   abort if client gone; EXPIRE tms:starting each iter; never publish before readiness
+P2 select candidate: by order, exclude card_stream_ids(); CAPACITY PRECHECK
+   (profile_connections vs max BEFORE any network); per-account Redis token bucket gates
+   network; probe_mode==byte_probe ? require sustained bytes : capacity_only
+P3 re-check channel_stream:{int}==CARD (autonomous-failover guard); reserve atomically;
+   SET channel_stream:{int}=S ex SWITCH_TTL, SET stream_profile:{S}=P ex SWITCH_TTL
+P4 re-check generation + client; (non-owner) HSET metadata STREAM_ID/M3U_PROFILE;
+   change_stream_url(uuid,new_url,UA,S,P); on success PERSIST the two keys
+P5 DEL tms:switch_inflight, DEL tms:starting, trigger_refresh()
+```
+
+**Capacity precheck before any network** (failover-wave / provider-ban safety): never open an upstream for a maxed profile; stay on the card instead. **Per-account cap is a fleet-global Redis token bucket** (`tms:probe_inflight:{account}` INCR/EXPIRE/DECR), NOT a process-local semaphore (`get_stream` runs in every web worker). Default `probe_mode=capacity_only` (no network) in v1.
+
+**Known-good fast-path** (step 2): a pure Redis read of `tms:health:{top.id}`. Health is keyed by **stream id**, so one probe of a popular source warms the fast-path for every channel listing it (≈ one probe per distinct healthy stream per `HEALTH_OK_TTL`, not per channel).
+
+#### 3.4.7 Races & guards
+
+- **Probe before init:** bounded `wait_ready` (P1); never publish before `check_if_channel_exists`.
+- **Client disconnect during probe:** checked at P1/P2/before-P4. Before P3 INCR → plain ABORT (card released by teardown). After P3 INCR → `ABORT_RELEASE_REAL`: **atomic** (Lua/WATCH) DECR `P` only if `channel_stream:{int}` still equals S, deleting keys in the same txn — so it and `release_stream` can't double-DECR.
+- **Re-tune during probe:** `tms:starting` token; stale-token probe ABORTs (or ABORT_RELEASE_REAL if it reserved). Re-checked just before the irreversible publish.
+- **Non-owner switch:** keys + metadata written before publish; a lost event degrades to "stayed on card," never a leak/wrong source.
+- **Probe-thread death:** `tms:starting` TTL (> full budget) self-heals; P3 keys are TTL'd until commit. Probes never run in Celery; no `finally` is load-bearing.
+- **Autonomous proxy failover (`get_alternate_streams`):** the proxy may switch a stalled card on its own (it reserves via `profile_connections` too). Mitigation: route always-card through the **static** card (continuous encoder, won't trip stall detection) and re-check `channel_stream:{int}==CARD` at P3 before reserving; a proxy-initiated switch invalidates the generation token.
+
+#### 3.4.8 Card-session / single-flight lifecycle
+
+`channel_stream:{int}=CARD` carries `CARD_SESSION_TTL`. The single-flight guard `tms:starting:{int}` is the **sole authoritative INCR gate**; its TTL > `WAIT_READY + PROBE + SWITCH` budgets and is **re-asserted (EXPIRE) on every card return** so it can't lapse mid-probe. Restore (step 1) treats a restored card as terminal only while `tms:starting` exists; a card that outlived its probe (probe death) is re-armed on the next tune. This closes both the double-INCR window and the stuck-on-card window.
 
 ### 3.5 Configuration & plugin UI
 
-**Decision: namespaced flat keys, NOT a JSON blob** (Dispatcharr `fields[]` are flat/typed/single-value; a blob loses labels/help and corrupts trivially). Existing keys are **not renamed** (renaming silently resets prod). New `startup_*` keys get a clean prefix.
+**Namespaced flat keys** (not a JSON blob — Dispatcharr fields are flat/typed). Existing keys unchanged. v1 fields: *shared* `tms_log_level`, `video_encoder`; *dynamic (existing)* `tms_enabled`, `stream_title`, `stream_description`, `stream_channel_cols`, `tms_image_path`, `theme_*`; *startup (new)* `startup_enabled`, `startup_title`, `startup_message`, `startup_image_path`, `startup_bg_color`, `startup_text_color`, `startup_accent_color`. All probe/health knobs (`card_session_ttl`, `starting_ttl`, `probe_mode`, `card_inflight_cap`, timeouts, TTLs, per-account cap) are **file-only overrides**, defaulted in code. Booleans as `number` 0/1 via a `_b` coercer (nonzero→1).
 
-**Single-source-of-truth fix (blocker).** `plugin.py` `fields[]`/`actions[]` are **duplicated in `plugin.json`** and already drift (2.1.3 vs 2.2.3). **Every field/action change MUST land in both**, and `build.sh` ships `plugin.json`. **Recommendation: generate `plugin.json` from one Python field-spec list** at build time (a `gen_plugin_json.py` step in `build.sh`); at minimum reconcile the versions and edit in lockstep.
+**Blocker fixes:** (1) the Save path must stamp `schema_version=2` and `_migrate_persistent` **before** `json.dump` (it currently bypasses `from_dict`/`dict()`); the migration write-back must be atomic (`tempfile + os.replace`, ideally host-only); (2) startup-colour inheritance ("inherit `theme_*` on first enable") runs in `from_dict` (sees merged DB themes), not in `_migrate_persistent`; (3) **plugin.json must be generated from one field-spec** (or edited in lockstep) and the 2.1.3/2.2.3 skew reconciled. `clear_cache()` → registry `reload()` + RenderManager rebuild + (host only) `server.reload()`. `actions[]` adds `apply_startup_stream`, `remove_startup_stream` (confirm), `reconcile_managed_streams`; `run()` gains explicit per-action dispatch + an `apply(key)`/`remove(key)` helper.
 
-**Reduced UI surface (review-driven UX fix).** The 9 internal probe knobs are **NOT** top-level fields. v1 exposes only:
+### 3.6 Channel application & ordering (membership @ 9998)
 
-*Shared:* `tms_log_level`, `video_encoder`.
-*Dynamic (existing, UNCHANGED keys):* `tms_enabled` (number 0/1, default 1), `stream_title`, `stream_description`, `stream_channel_cols`, `tms_image_path`, `theme_bg_color`, `theme_card_bg_color`, `theme_card_border_color`, `theme_text_color`, `theme_accent_color`, `theme_accent_text_color`.
-*Startup (new):* `startup_enabled` (number 0/1, default 0), `startup_title`, `startup_message`, `startup_image_path`, `startup_bg_color`, `startup_text_color`, `startup_accent_color`.
+**Placement (D2).** `startup` gets `apply_order=9998`, `m3u_account_id=1` (profile 1 / unlimited), distinct name/path. A real membership row gives: literal "added to all channels," channel-UI visibility/reorder/remove, and a terminal fallback if the override is ever absent (the loop reaches 9998 before 9999 → worst case shows a card, never a 503/black).
 
-All probe/health-gate knobs (`card_session_ttl`, gate on/off, timeouts, TTLs, min_bytes, per-account concurrency) are **persistent-file-only overrides**, defaulted in code, never shown in the form. Booleans encoded as `number` 0/1 are normalized by an `_b` coercer (**any nonzero → 1**).
-
-**`tms_enabled=0` interaction (review-driven).** When `tms_enabled=0` with ~2806 live order-9999 rows still applied: the override **skips the card branch and falls through to a graceful 503** (the existing "No compatible profile" error), rather than the server 404-ing `/stream.ts` mid-stream. `help_text` warns that disabling without removing leaves dead membership.
-
-**Config model & save path (blocker fix).** Two concrete code changes the draft omitted:
-1. `save_plugin_persistent_config` (or `run()`'s save branch) **must stamp `schema_version=2` and run `_migrate_persistent` on the raw dict before `json.dump`** — the current path bypasses `from_dict`/`dict()` entirely.
-2. The **startup-colour inheritance** ("inherit existing `theme_*` on first enable") **must run in `from_dict`** (which sees the fully merged `final_data` incl. DB `theme_*`), **not in `_migrate_persistent`** (which sees only the file).
-
-`PluginConfig` keeps a **flat face** (so `config.stream_title` etc. keep working) and gains a **derived `streams` projection** rebuilt every `from_dict` (never persisted; `dict()` pops it). The registry overlays its `renderer`/`behavior` blobs from `config.stream(key)`. `clear_cache()` additionally calls `ManagedStreamRegistry.reload()` and rebuilds `RenderManager`, and — **only in the hosting process** — `server.reload()`. The **file-overrides-DB** precedence is a pre-existing UX hazard now amplified by more keys; documented in `help_text`.
-
-**`actions[]`** — keep the four existing; add `apply_startup_stream`, `remove_startup_stream` (confirm), `reconcile_managed_streams` (no confirm). `run()` gains **explicit dispatch branches per action id**; a small `apply(key)` / `remove(key)` helper takes the registry key.
-
-### 3.6 Channel application, ordering & migration
-
-**Startup is programmatic-only by default (no membership row).** This is the safest resolution of the order-0 trap: the card is returned by the override, never reached by the order loop, and there is no inert row to become a trap if the override is ever absent. "Apply to all channels" for startup is a **global enable + optional scope**, toggled by `apply_startup_stream`/`remove_startup_stream`. *If* channel-edit-UI visibility / `ChannelStream`-queryability is required (OQ), startup is placed at a **high order (9998)** and the loop's `card_stream_ids()` exclusion guarantees it is never mis-selected; it is **never** placed at order 0.
-
-**`is_streams_maxed` refactored to a pure read** (resolves the §3.4-vs-§3.6 contradiction). Membership is owned solely by apply/remove/reconcile; the maxed branch no longer mutates membership or stops channels. `tms` continues to be applied at order 9999.
-
-**Apply (batched, idempotent — replaces N+1)** for any membership-bearing card:
-
+**Loop hard-exclusion (load-bearing):**
 ```python
-def apply_to_all_channels(spec, batch_size=1000):
-    if spec.apply_order is None: return            # programmatic-only; nothing to insert
-    stream = registry.get_or_create_stream(spec)
-    all_ids  = set(Channel.objects.values_list("id", flat=True))
-    existing = set(ChannelStream.objects.filter(stream_id=stream.id).values_list("channel_id", flat=True))
-    rows = [ChannelStream(channel_id=c, stream_id=stream.id, order=spec.apply_order)
-            for c in (all_ids - existing)]
-    for i in range(0, len(rows), batch_size):
-        ChannelStream.objects.bulk_create(rows[i:i+batch_size], ignore_conflicts=True, batch_size=batch_size)
+card_ids = registry.card_stream_ids()      # frozenset({STARTUP_ID, TMS_ID})
+for stream in self.streams.all().order_by("channelstream__order"):
+    if stream.id in card_ids: continue      # never reserve a managed card as a real source
+    ...
 ```
+Without it the order-9998 card (always a "free slot") would be selected the moment the loop reaches it. Guard is on `stream.id` (int PK). 9998<9999 is a fallback-priority guarantee, never a selection mechanism (the loop never reaches a card while the override is present).
 
-O(1) stream queries; idempotent; `ignore_conflicts` guards concurrent apply. Re-applying `tms` adds 0 rows.
+**`is_streams_maxed` → PURE read** (HARD precondition). It must NOT call `add/remove_stream_from_channel`/`stop_channel` (today it stops the channel when false — catastrophic across 2806, a fleet-stop storm under D1+D2). Membership owned solely by apply/remove/reconcile; the maxed branch only reads `tms:maxed_out:{ch}`.
 
-**Remove (fleet-safe bulk):** `ChannelStream.filter(stream_id=stream.id).delete()`. Default `stop_running=False` (does NOT stop the fleet — today's per-channel remove stops channels, catastrophic across 2806). `stop_running=True` opt-in, scoped via Redis to channels currently on this card.
+**Apply (batched, idempotent, parameterised by key):** `get_or_create_stream` → `bulk_create(ignore_conflicts)` over `all_channel_ids − existing` at `spec.apply_order`. O(1) stream queries; startup@9998 and tms@9999 coexist. **Remove (fleet-safe):** bulk `ChannelStream.filter(stream_id=…).delete()` with `stop_running=False` default (never stops the fleet); `stop_running=True` opt-in, Redis-scoped to parked channels. **New channels:** `post_save(Channel, created=True)` signal (within-process `dispatch_uid`, in web AND celery) + idempotent `reconcile_managed_streams` backstop (covers `bulk_create` M3U imports that skip `post_save`).
 
-**New-channel handling.** `post_save(Channel, created=True)` signal (primary) + manual `reconcile_managed_streams` (backstop). **`dispatch_uid` dedups receivers WITHIN a process**, **not across processes** — cross-process double-apply is moot because a `Channel.save()` only fires receivers in the saving process. The signal **is installed in Celery too** (like the override) so single-row creates in Celery tasks apply correctly; the **real gap is `bulk_create` M3U imports** (which skip `post_save`), covered by reconcile. (For programmatic-only startup, the signal is a no-op — there is no row to add.)
+**Override install must precede serving:** install at an app-ready hook (not lazy first-instantiation), else the override-absent window lets stock `get_stream` select the 9998 card and park with no probe. Belt-and-braces: on seeing a stock-set `channel_stream:{int}=STARTUP_ID` with no live `tms:starting`, treat as a fresh card and arm a probe.
 
-**Disable** (`<kind>.enabled=False`) is a config flag, cheap and reversible. For `tms` it leaves the order-9999 rows inert and the override skips the card branch (graceful 503, not 404 mid-stream). For programmatic-only startup, disable is simply the gate going inactive — there are no inert rows to become a trap.
+## 4. Redis keys
 
-## 4. Data model & Redis keys
+| Key | Id | Value | TTL | Writer → Reader | Notes |
+|---|---|---|---|---|---|
+| `channel_stream:{int}` | channel int PK | sid (CARD or S) | card/probe: TTL'd until commit; real-committed: PERSIST | plugin → override restore, `release_stream` PRIMARY | |
+| `stream_profile:{sid}` | stream id | pid (1 / P) | matches its `channel_stream` | plugin (**written before `change_stream_url`**) → `release_stream`, `update_stream_profile` | feeds the no-op |
+| `profile_connections:{P}` | profile id | int | none | plugin **INCR once** ↔ core **DECR once** | the leak-critical cell; one writer per direction |
+| `tms:starting:{int}` | channel int PK | `<token>` | `STARTING_TTL` > all budgets; re-asserted each card return | plugin → probe generation | single-flight + INCR gate; self-heals |
+| `tms:switch_inflight:{int}` | channel int PK | 1 | `SWITCH_TTL` | plugin | guards P3→P4 |
+| `tms:health:{sid}` | stream id | ok/bad | ok≈90s / bad≈25s | probe (web) → fast-path | one probe warms the fleet |
+| `tms:probe_inflight:{account}` | account id | int | short EX | probe INCR/DECR | **fleet-global** per-account network cap |
+| `tms:card_inflight` | — | int | short EX | card serve INCR/DECR | concurrent-card cap (NVENC guard, §5); over cap → 503 |
+| `tms:maxed_out:{int}` | channel int PK | int | 30s | pure `is_streams_maxed` | unchanged |
+| `ts_proxy:channel:{uuid}:metadata` | channel UUID | hash | proxy-managed | core / plugin (non-owner) → `release_stream` FALLBACK | fields `STREAM_ID`/`M3U_PROFILE` |
 
-**Dispatcharr `Stream` rows:**
+## 5. Resource impact
 
-| key | Stream.name | stored Stream.url | served paths | apply_order |
-|---|---|---|---|---|
-| `tms` | `TooManyStreams` | `http://127.0.0.1:1337/stream.ts` | `/stream.ts`, `/`, `/tms/tms.ts` | 9999 |
-| `startup` | `TMS: startup stream` | `http://127.0.0.1:1337/tms/startup.ts` | `/tms/startup.ts` | None (programmatic-only) |
+**Plugin side (cheap):** concurrent card encoders = distinct cards viewed, not channels. Many channels on `startup` share ONE encoder via path fan-out (~1% core at 1fps with `-re`; ~30–60 MB; static card has no updater). O(1) in channels.
 
-**Redis keys:**
+**System side (the real cost, linear):** each card-served channel = one downstream proxy ffmpeg (nvenc on prod) transcoding the card. 50 card channels = 1 plugin encoder + **50 downstream nvenc transcodes**.
 
-| Key | Value | TTL | Notes |
-|---|---|---|---|
-| `channel_stream:{int channel_id}` | stream_id | none for real (proxy lifecycle); **short TTL (`card_session_ttl`, ~20s) when set to a card** | keyed by **integer PK**; card writes get a TTL so parked channels re-select |
-| `stream_profile:{stream_id}` | m3u_profile_id (1 for card) | matches its `channel_stream` lifecycle | card variant orphan is harmless |
-| `profile_connections:{profile_id}` | int | none | **INCR only by the normal loop when `max_streams>0`; no DECR in plugin** (release is Dispatcharr's) — card never touches it |
-| `tms:maxed_out:{channel_id}` | int | 30s (existing) | unchanged; now read by a **pure** `is_streams_maxed` |
-| `tms:health:{stream_id}` | `ok`/`bad` | conservative ok-TTL / short bad-TTL | **only used when the optional gate is enabled**; populated by the web-process, capacity-aware background check |
-| `ts_proxy:channel:{uuid}:metadata` | hash | proxy-managed | read by dynamic grid / log filter |
+**Healthy tunes under D1:** the known-good fast-path makes warm tunes **byte-identical to today** (Redis read → direct connect). Cold/unknown tunes pay one card encode + one nvenc + one card→real rebuffer, then run real; subsequent tunes within `HEALTH_OK_TTL` are fast-path-direct.
 
-**No untTL'd plugin-written card session** — the explicit card-session TTL is the mechanism that prevents "stuck on card forever." (Probe-specific guard/single-flight keys belong to the deferred feature and are not in v1.)
+**NVENC-session wall (hard ceiling):** on a failover wave the fast-path gives **zero** relief (health cold/bad fleet-wide), so all affected channels card simultaneously. Consumer GPUs cap concurrent NVENC sessions (~3–8); past that, transcodes **fail** and teardown/retune churn amplifies. **Mitigation (required):** the `tms:card_inflight` counter caps concurrent card-served channels; beyond it the override returns a graceful 503 instead of parking-and-failing. Documented operational limit.
 
-**Persistent config (v2, flat):** `schema_version: 2` + all flat keys. Rendered images at `/data/plugins/TMS_Persistent_Config/tms_render/<key>.jpg`.
-
-## 5. Resource impact (honest accounting)
-
-**Per-warm-encoder (plugin side):** ~1% of one core at 1 fps **because of `-re`** (without it, ~3 cores); ~30–60 MB RSS + the JPG; 1 ffmpeg + 1 broadcaster (+ updater for dynamic). **Plus per-client queue memory:** up to 50 × `1316*16` ≈ 1 MB/client; a 50-client wave ≈ ~50 MB of buffered TS in the plugin process, plus thread stacks.
-
-**Plugin-side vs system-side (review-driven separation):**
-- **Plugin side** — concurrent encoders = number of **distinct cards currently being viewed** (not channels, not configured cards). Many channels on one card share one encoder via path fan-out. This part is genuinely cheap.
-- **System side** — each maxed/parked channel is a **separate downstream proxy ffmpeg (nvenc on prod)** pulling `:1337`. 50 concurrent channels on the card = 1 plugin encoder + **50 downstream nvenc transcodes** of the (low-bitrate, GOP-1) card. The card being cheap per-transcode keeps each small, but **system cost scales linearly with concurrent card-served channels** — it is **not** scale-free.
-
-**Why the finalized model is much cheaper than "always card":** the startup card is served **only on failure**, not on every tune. Healthy tunes incur **zero** card cost (plugin or downstream), zero switch, zero rebuffer — identical to today. The card encoder warms only during genuine maxed/failure conditions.
-
-**Steady-state correction (review-driven).** "0 encoders when nothing maxed" is true only with no persistent clients. Per prod reality, TiviMate often **holds a persistent connection** to a card-fed channel, keeping that encoder warm indefinitely (idle-stop is 60s after the *last* client). Quantify warm-fraction empirically rather than asserting 0.
-
-**Mass-failover restarts (review-driven).** The dynamic `tms` encoder restarts **once per active-set transition** during a wave (each flip changes the grid → re-render + ffmpeg respawn), **not once total.** A debounce/coalesce window is a recommended hardening (Phase 6), not a v1 requirement.
+**Steady state:** "0 encoders when idle" holds only with no persistent clients; TiviMate-style persistent connections keep an encoder warm (idle-stop 60s after last client). Quantify warm-fraction empirically. **Mass-failover dynamic-card restarts** scale with active-set transitions (Phase 6 debounce).
 
 ## 6. Backward compatibility & migration
 
-**Strictly additive.** `tms` keeps `name="TooManyStreams"`, stored `url="/stream.ts"`, `order=9999`; prod row id=195362 and its ~2806 rows satisfy the registry identity (best-effort `get_or_create` returns the existing row **for default host/port**; non-default `TMS_PORT`/`TMS_HOST` risks a duplicate row — documented). `/stream.ts` and `/` serve identical bytes. `get_stream_url()` keeps its `/stream.ts` return. Existing actions keep ids. Startup ships **disabled & un-applied** ⇒ no behavioural change until opt-in.
-
-**Config migration (v1→v2), additive-only & idempotent.** `_migrate_persistent(data)` only **stamps and back-fills** (never drops/rewrites): if `version<2`, add new keys (startup disabled; `tms_enabled=1`), set `schema_version=2`. **Startup-colour inheritance is performed in `from_dict`** (sees merged DB `theme_*`), not in the migration. The migration runs in `get_plugin_persistent_config()` (called at import in **every** process) — so the write-back **must be atomic** (`write tempfile + os.replace`) and ideally guarded to the hosting process. **The Save path must also explicitly stamp v2 + migrate before `json.dump`.**
-
-**Build/packaging.** `cp -r src` ships new subpackages **only if `src/managed_streams/__init__.py` and `src/renderers/__init__.py` exist** — add them. `plugin.json` must be rebuilt in lockstep with fields (ideally generated). Reconcile the existing 2.1.3/2.2.3 skew. New `/tms/<key>.ts` paths + renderer package must be in the shipped zip or channels point at paths the running server doesn't serve.
+Strictly additive: `tms` keeps name/url/order; prod row 195362 + ~2806 rows satisfy identity (best-effort `get_or_create`; non-default host/port risks a duplicate row — documented). `/stream.ts`+`/` serve identical bytes. Startup ships disabled & un-applied. Config v1→v2 additive-only (`_migrate_persistent` stamps + back-fills; atomic write-back; Save path must also stamp/migrate). Packaging: add `src/managed_streams/__init__.py` + `src/renderers/__init__.py` (relative imports); ship the new path + renderers; reconcile plugin.json/version. **Migration ordering on the live box:** operator-driven two-step — `apply_startup_stream` (insert 9998 rows, idempotent, inert behind the loop guard) then flip `startup_enabled`. Reversible.
 
 ## 7. Edge cases & failure modes
 
-- **All real candidates maxed:** override returns the card with profile 1 (no INCR); the **card-session TTL** ensures the next tune re-selects when a slot frees — no stuck-on-card, no leak, no live switch.
-- **Channel parked on card, source recovers:** recovers on next re-tune after the card-session TTL expires (v1); proactive recovery is the deferred switch feature.
-- **`tms_enabled=0` with live memberships:** override skips the card branch → graceful 503, not a mid-stream 404.
-- **Static user image swapped on disk:** picked up **only** at cold start (post idle-stop) or explicit `reload()`; while warm the image is frozen.
-- **Bad/corrupt/missing user image:** `StaticRenderer` falls back to card mode — never a black screen.
-- **Disabled key:** override doesn't return it; server 404s the path; `/` alias 404s if `tms` disabled; `/healthz` matched before `/`.
-- **Two workers race a Stream row / apply:** `get_or_create` (best-effort) + `bulk_create(ignore_conflicts)` keep both safe; a duplicate row only arises under non-default host/port.
-- **Dynamic grid self-exclusion:** excludes **all** managed-card ids so card-parked channels never leak into the grid.
-- **Mass failover encoder churn:** restarts scale with active-set transitions; debounce is a Phase 6 hardening.
-- **Optional health gate (if enabled):** false-`ok` poisoning and provider-connection consumption are explicitly bounded (web-process-only, capacity-aware, per-account-throttled, sustained-bytes ok-criterion). Default OFF.
-- **Dead-`:1337`-listener:** `/healthz` lets the host self-check without warming an encoder; paired with `_can_bind`/single-host gating.
+- **Cold tune:** card → probe → switch; leak-free (§3.4.3). Warm tune: fast-path direct, no card.
+- **All real maxed:** capacity precheck → stay on card (Δ=0); re-selects on next tune after `CARD_SESSION_TTL`.
+- **Probe-thread death mid-switch:** P3 keys TTL'd; `tms:starting` TTL self-heals.
+- **Client disconnect mid-probe:** ABORT (pre-reserve) / atomic ABORT_RELEASE_REAL (post-reserve) — no leak.
+- **Autonomous failover races probe:** static card + P3 `channel_stream==CARD` re-check + generation token.
+- **Double release_stream:** guarded by Dispatcharr's HDEL/DELETE.
+- **`tms_enabled=0` with live rows:** override skips the card branch → graceful 503, not mid-stream 404.
+- **Failover wave > NVENC cap:** `tms:card_inflight` → 503 beyond the cap.
+- **Disabled key / `/` alias when tms disabled:** 404; `/healthz` matched first.
+- **Dynamic grid self-exclusion:** excludes ALL card ids so card-parked channels never leak into the grid.
+- **Override-absent window:** app-ready install + stock-card probe-arm.
 
-## 8. Phased implementation plan
+## 8. Phased implementation plan (switch-path in v1)
 
-Each phase is independently shippable; nothing before its phase changes runtime behaviour for existing installs.
+- **Phase 0 — Renderer decoupling + long-lived renderer (coupled).** Instance `_last_signature` + one persistent renderer per channel; extract `draw_utils.py`. Byte-identical.
+- **Phase 1 — Config model + registry.** schema v2, dataclasses + derived `streams`, `_migrate_persistent`, atomic write-back, **Save-path v2 stamping**, `from_dict` colour inheritance, `card_stream_ids()`. Only `tms` enabled.
+- **Phase 2 — Multi-stream StreamServer.** `ManagedStreamChannel` + `StreamServer(registry)`, routing + `/healthz` + `reload()` (no-op off-host); host keeps a server reference. `/stream.ts`+`/` identical.
+- **Phase 3 — Loop exclusion + PURE `is_streams_maxed` + atomic reservation + batched apply/remove + signal/reconcile.** (Pure `is_streams_maxed` is a HARD precondition for Phase 5.)
+- **Phase 4 — Static `startup` renderer + card served + 9998 membership (no override switch yet).** `StaticRenderer`; enable path (config-disabled default); `apply/remove_startup_stream`; startup fields in plugin.py + plugin.json (generated); override install → app-ready hook.
+- **Phase 5 — ALWAYS card then switch (v1 trigger model).** Override always-card branch returning `(STARTUP_ID, 1, None)` with re-asserted single-flight; web-process probe (capacity precheck, fleet-global per-account cap, `capacity_only` default); atomic reservation; `change_stream_url` switch with `stream_profile:{S}=P` written **before** (so `update_stream_profile` no-ops); non-owner metadata write + ordering; atomic `ABORT_RELEASE_REAL`; `tms:card_inflight` cap + 503; known-good fast-path (default ON). Probes NEVER in Celery.
+- **Phase 6 — Hardening.** `byte_probe` mode behind the Redis cap; updater debounce; uninstall/rollback; autonomous-failover coalescing; optional reconcile beat.
 
-**Phase 0 — Renderer decoupling + long-lived renderer (coupled, per review).** Replace the class-global `_last_active_uuids` with instance `_last_signature` **and** make the updater/`ManagedStreamChannel` hold **one persistent renderer instance** across iterations (the two are inseparable — splitting them regresses the dynamic card). Extract `draw_utils.py`. Output byte-for-byte identical. *Ships invisibly; unblocks everything.*
+## 9. Correction note: the slot-leak blocker was a false alarm
 
-**Phase 1 — Config model + registry (no new streams served).** Add `CONFIG_SCHEMA_VERSION`, the config dataclasses + derived `streams` projection + `tms_enabled`, `_migrate_persistent`, **atomic write-back**, **save-path v2 stamping**, **from_dict colour inheritance**. Add `src/managed_streams/` (with `__init__.py`), only `tms` enabled. Wire `clear_cache()`→`reload()` + `card_stream_ids()`. *UI/behaviour unchanged.*
+An earlier multi-agent review claimed always-card "permanently leaks a `profile_connections` slot because no DECR exists." **False** — that review only grepped the plugin repo, not Dispatcharr core, and additionally hallucinated a "v0.26.0 `live_proxy`" tree (wrong namespace and line numbers). Verified against the deployed **0.21.1 / `ts_proxy`** container:
 
-**Phase 2 — Multi-stream StreamServer (still only `tms`).** Split into `ManagedStreamChannel` + `StreamServer(registry)`; path routing + `/healthz` (matched before `/`) + `reload()` (no-op off-host); `RenderManager`; **host keeps a server reference**. `/stream.ts` + `/` serve `tms` identically. *Verified identical bytes.*
+- **`Channel.release_stream()` (models.py:533) is the DECR owner**, on every teardown path (views ×4, server ×2, `stop_channel`, stream_generator): PRIMARY `channel_stream:{int}`→`stream_profile:{sid}`→DECR `profile_connections` (~627); FALLBACK via metadata `ts_proxy:channel:{uuid}:metadata` `STREAM_ID`/`M3U_PROFILE` (~580); HDEL/DELETE guard double-release. ⇒ a switch that mirrors `get_stream` (SET `channel_stream:{int}=S`, SET `stream_profile:{S}=P`, INCR `profile_connections:{P}`) is released correctly. One manual INCR ↔ one core DECR. **No leak.**
+- **The one real subtlety the review surfaced (correctly, despite wrong citations):** the switch path *itself* can INCR — `change_stream_url`→`update_url` (stream_manager.py:1060) calls `channel.update_stream_profile(P)` (line 1083 → models.py:651), which INCRs `profile_connections:{P}` unless `current==new`. **Neutralized by writing `stream_profile:{S}=P` before the switch** so it early-returns (§3.4.5). The leak-free proof therefore depends on *ordering*, not on the (false) "the switch never INCRs."
+- **Also confirmed real:** autonomous failover (`get_alternate_streams`, url_utils.py:279) can independently switch a stalled stream — guarded per §3.4.7(f).
 
-**Phase 3 — Loop exclusion + pure `is_streams_maxed` + batched apply/remove + signal/reconcile.** Add the `card_stream_ids()` exclusion to the normal loop (safe: only `tms` at 9999, behaviour unchanged). Refactor `is_streams_maxed` to pure. Generalize apply/remove (batched, idempotent, fleet-safe remove); keep `apply/remove_from_all_channels` as `tms` wrappers. Install `post_save` signal (within-process `dispatch_uid`) + `reconcile_managed_streams`. *Dynamic card unaffected; startup not enabled.*
-
-**Phase 4 — Static renderer + `startup` card served (no override change).** Implement `StaticRenderer` (card + passthrough). Enable the `startup` built-in path (config-disabled by default). Add startup `fields[]` (both `plugin.py` and `plugin.json`/generator) + `apply_startup_stream`/`remove_startup_stream`. Because `startup` is **programmatic-only (no membership)**, applying it cannot wedge the order loop. Serving `/tms/startup.ts` works for preview; no runtime selection yet. *Configure/preview the card.*
-
-**Phase 5 — Startup runtime flow (real-first, card-on-failure).** Add the override's failure-branch return of `(startup_card_id, 1, None)` with the **TTL'd card session**, gated on `is_kind_active(startup)`. No probe, no live switch, no manual reservation. *The card appears on genuine maxed/failure tunes for opted-in installs; zero healthy-path change.*
-
-**Phase 6 — Hardening / optional features.** Per-card encoder override; updater debounce/coalesce; uninstall/rollback (disconnect signal, restore `Channel.get_stream`, optional row purge); **and — only if proactive recovery over re-tune is chosen (OQ) — the deferred probe+switch feature**, which must first deliver: verified teardown-DECR owner, pinned channel-id identity for `change_stream_url`, all-inclusive time budget with guard `EXPIRE`, per-account probe semaphore + capacity precheck, Celery-thread-death TTL self-heal, non-owner pubsub ordering/ack, and false-`ok` poisoning mitigation. Optional capacity-aware health gate. Optional hourly reconcile beat.
-
-## 9. Open questions / decisions for the user
-
-See the **Open questions / decisions for the user** section near the top (trigger model, live-switch deferral, card placement/order, health-gate default, `is_streams_maxed` refactor, `tms_enabled` kill-switch behaviour, plugin.json single-source, Celery probe policy, row purge, reconcile beat, image dedup, user-defined cards). Recommended defaults are stated inline.
-
----
-
-### Review issues resolved (what changed from the draft)
-
-- **Blockers (slot leak):** the "always card then probe-and-switch + manual INCR" mechanism is **removed from v1.** The finalized "real-first, card-on-failure" model performs **no manual `profile_connections` mutation** (card = profile 1, unlimited, no INCR, nothing to release), eliminating the leak class entirely. Any future proactive-recovery switch is deferred behind a hard prerequisite to first identify a verified teardown-DECR owner.
-- **Blockers (session write before switch, channel-id identity, non-owner pubsub):** the live switch is **deferred**; v1 has no out-of-band session write racing a switch and no cross-identifier hazard. Card sessions are written under the **integer PK** with an explicit **TTL**.
-- **Blocker plugin.json drift + version skew:** elevated to a first-class requirement — edit both / generate `plugin.json` from a field-spec; reconcile 2.1.3/2.2.3.
-- **Blocker save-path bypass:** documented that Save uses raw `json.dump`; specified the required v2-stamp + migrate-before-write change.
-- **Major fast-path/order-0/normal-loop mis-selection:** the normal loop now **hard-excludes `card_stream_ids()`**; `startup` is **programmatic-only**; the fragile fast-path is removed (the optional health gate is a hot-path Redis read only, default off).
-- **Major `is_streams_maxed` mutation contradiction:** refactored to a **pure read**; membership owned by apply/remove/reconcile; maxed branch no longer stops channels.
-- **Major resource accounting:** §5 rewritten to separate plugin-side from system-side cost, correct "0 encoders" and "restart once"; the card now costs nothing on healthy tunes because it is failure-only; provider-connection and health-gate risks bounded; gate ships off by default.
-- **Major Phase-0 entanglement:** the instance-signature fix is **merged with long-lived-renderer ownership** into Phase 0.
-- **Major reload/registry desync, signal-in-Celery, fresh-tune DB cost, apply hot-path tax:** host keeps a server reference, `reload()` no-op off-host with a stated cross-process ordering invariant; `dispatch_uid` rationale corrected (within-process); candidate-existence check reuses the loop's queryset with no extra `m3u_account` deref.
-- **Minors/nits:** encoder-snapshot freshness, enabled-only routing, static-image freshness, stuck-on-card TTL, self-exclusion of all card URLs, atomic migration write-back, `get_or_create` non-atomicity, host/port-in-url duplicate-row risk, default-image path mapping, `__init__.py` packaging, `tms_enabled=0` 404→503, run() dispatch wiring, queue memory accounting, UI knob reduction + `_b` coercer — all incorporated.
+### Provenance of facts
+Every Dispatcharr citation here was read from the running `jflix_dispatcharr` container (0.21.1). The agent-supplied `live_proxy` / `models.py:743/854` / `manager.py:1164` / `live:channel:` citations were hallucinated and are **not** used.
