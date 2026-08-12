@@ -279,21 +279,87 @@ class TooManyStreams:
 
     @staticmethod
     def is_streams_maxed(channel_id) -> bool:
+        """Has this channel hit its connection limit recently?
+
+        This runs inside get_stream, on the tune path, so it only reads. It used to
+        also tidy membership: add the card when maxed, and -- the dangerous half --
+        remove_stream_from_channel when not, which does stop_channel +
+        proxy_server.stop_channel. A predicate that stops channels is a landmine
+        across ~2806 of them, and it only stayed harmless because the branch is
+        unreachable in the current layout (the card sits at order 9999 with an
+        unlimited profile, so the selection loop returns it before we ever get here).
+        Membership is owned by the explicit apply/remove actions instead. The add is
+        kept -- it is how the card reaches a channel for installs that have not
+        applied it fleet-wide -- and a card row left behind is inert, since the loop
+        only reaches order 9999 when nothing real is free.
+        """
         channel_id = str(channel_id)
         redis_client = RedisClient.get_client()
         key = f"tms:maxed_out:{channel_id}"
         try:
             val = int(redis_client.get(key) or 0)
         except: val = 0
-        
+
         is_maxed = val >= TooManyStreams.TMS_MAXED_COUNTER
         if is_maxed: TooManyStreams.add_stream_to_channel(channel_id)
-        else: TooManyStreams.remove_stream_from_channel(channel_id)
         return is_maxed
+
+    @staticmethod
+    def reserve_profile_slot(profile, redis_client) -> bool:
+        """Claim one connection slot on `profile`. Returns False if it is full.
+
+        Atomic on purpose. The old form -- GET, compare, SET, INCR -- let concurrent
+        tunes all read the same pre-INCR count and admit past max_streams during a
+        failover wave. INCR-then-check-and-roll-back is what Dispatcharr core does
+        (_check_and_reserve_profile_slot, apps/channels/models.py ~408), so mirroring
+        it also keeps our accounting shaped the way release_stream expects.
+        """
+        if profile.max_streams == 0:
+            return True                       # unlimited -- never counted, never INCR'd
+
+        key = f"profile_connections:{profile.id}"
+        if redis_client.incr(key) <= profile.max_streams:
+            return True
+        redis_client.decr(key)                # lost the race; net zero
+        return False
 
     @staticmethod
     def trigger_refresh():
         TooManyStreams.REFRESH_SIGNAL.set()
+
+    @staticmethod
+    def ordered_candidates(channel):
+        """The channel's streams, best-first, with managed cards pinned last.
+
+        Real sources are ordered by what they were last measured to be carrying
+        (see QualityScanner); the channel's hand-ordering breaks ties and is the
+        whole ordering for a channel nobody has scanned, so an unscanned install
+        behaves exactly as it does today.
+
+        Cards stay last unconditionally rather than being ranked. A card is the
+        give-up path: if every real source is known bad we still want to *try* one,
+        because a verdict can be stale or a slate can go live at kickoff, and
+        showing a card to someone whose stream would have worked is worse than a
+        few seconds of buffering.
+        """
+        pairs = [
+            (cs.stream, cs.order)
+            for cs in ChannelStream.objects.filter(channel=channel)
+                                           .select_related("stream")
+                                           .order_by("order")
+        ]
+        card_ids = {TooManyStreams.get_card_stream_id()}
+        real = [(s, o) for s, o in pairs if s.id not in card_ids]
+        cards = [s for s, o in pairs if s.id in card_ids]
+
+        try:
+            from .QualityScanner import QualityScanner
+            ordered = QualityScanner.order_streams(real)
+        except Exception as e:
+            logger.warning("TooManyStreams: quality ranking unavailable, using channel order: %s", e)
+            ordered = [s for s, _ in real]
+
+        return ordered + cards
 
     @staticmethod
     def install_get_stream_override():
@@ -323,7 +389,7 @@ class TooManyStreams:
                 has_streams_but_maxed_out = False
                 has_active_profiles = False
 
-                for stream in self.streams.all().order_by("channelstream__order"):
+                for stream in TooManyStreams.ordered_candidates(self):
                     m3u_account = stream.m3u_account
                     if not m3u_account: continue
 
@@ -335,16 +401,25 @@ class TooManyStreams:
                         if not profile.is_active: continue
                         has_active_profiles = True
 
-                        profile_connections_key = f"profile_connections:{profile.id}"
-                        current_connections = int(redis_client.get(profile_connections_key) or 0)
-
-                        if profile.max_streams == 0 or current_connections < profile.max_streams:
+                        # Reserve atomically, THEN publish the keys release_stream
+                        # reads. Reserving first means a crash in between leaks at
+                        # most one slot; publishing first would let a concurrent
+                        # release DECR a slot we had not claimed yet.
+                        if TooManyStreams.reserve_profile_slot(profile, redis_client):
                             redis_client.set(f"channel_stream:{self.id}", stream.id)
                             redis_client.set(f"stream_profile:{stream.id}", profile.id)
-                            if profile.max_streams > 0: redis_client.incr(profile_connections_key)
-                            
+
                             TooManyStreams.trigger_refresh()
-                            self._tms_serving_card = False
+                            # The card is reachable through THIS loop, not just the
+                            # maxed branch below: it sits at order 9999 on an
+                            # unlimited profile, so on a fleet-applied install the
+                            # loop reaches it whenever nothing real is free. Hard-
+                            # coding False here told get_stream_profile "not the
+                            # card" while serving exactly that, and the copy profile
+                            # was only still picked up because get_stream_profile
+                            # happens to run on a re-fetched Channel whose flag is
+                            # unset, falling through to the Redis check.
+                            self._tms_serving_card = (stream.id == TooManyStreams.get_card_stream_id())
                             return stream.id, profile.id, None
                         else:
                             has_streams_but_maxed_out = True
