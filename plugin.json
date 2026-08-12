@@ -1,6 +1,6 @@
 {
   "name": "too_many_streams",
-  "version": "2.2.3",
+  "version": "2.2.4",
   "description": "Handles scenarios where too many streams are open and what users see. Features a customizable dynamic splash screen.",
   "author": "JamesWRC",
   "fields": [

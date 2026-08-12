@@ -21,6 +21,23 @@ IDLE_SHUTDOWN_GRACE = 60
 # does zero Redis/DB polling.
 ACTIVE_POLL_SECONDS = 60
 
+# Minimum gap between content-driven encoder restarts. Every restart resets the
+# MPEG-TS timestamps, which a downstream `-c copy` reader reports as a corrupt
+# packet / backward DTS jump and may drop the stream over. On a busy box the
+# active-channel set changes constantly, so without this the card can restart
+# repeatedly and keep breaking its own viewers.
+MIN_ENCODER_RESTART_INTERVAL = 30
+
+# Frames per second for the card. This is a probe-reliability knob, not a
+# picture-quality one -- the content is a still image, so any rate looks
+# identical. At 1 fps a single keyframe was ~100KB and a reader had to wait a
+# whole second per frame, so a client joining mid-stream frequently could not
+# identify the video within its probe budget and hung until it gave up.
+# ffmpeg's -analyzeduration counts STREAM time, which -re pins to wall-clock, so
+# the only way to put more frames inside a reader's probe window is to raise the
+# rate. 10 fps keeps each frame small and gives a joiner ~10 chances a second.
+CARD_FPS = 10
+
 
 class StreamServer:
     """
@@ -51,6 +68,8 @@ class StreamServer:
         self.clients = []
         self.clients_lock = threading.Lock()
         self._stop_timer = None
+        self._render_lock = threading.Lock()
+        self._last_start_ts = 0.0
 
         # Ensure image directory exists
         os.makedirs(os.path.dirname(self.image_path), exist_ok=True)
@@ -69,14 +88,14 @@ class StreamServer:
         cmd = [
             self.ffmpeg_bin,
             "-loglevel", "error",
-            # -re paces each input to wall-clock so ffmpeg emits 1 fps in REAL
+            # -re paces each input to wall-clock so ffmpeg emits CARD_FPS in REAL
             # time. Without it, -framerate/-r only set timestamp rate and ffmpeg
             # encodes the looped image flat-out; the broadcaster drains (and
-            # drops) frames with no backpressure, so a "1 fps" encoder pegs ~3
-            # CPU cores the whole time a client is connected. -re only paces
-            # reads -- it does NOT reintroduce the loop-wrap DTS jump.
+            # drops) frames with no backpressure, so a nominal low-fps encoder
+            # pegged ~3 CPU cores the whole time a client was connected. -re only
+            # paces reads -- it does NOT reintroduce the loop-wrap DTS jump.
             "-re", "-loop", "1",
-            "-framerate", "1",
+            "-framerate", str(CARD_FPS),
             "-i", img_path,
             "-re", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
             "-c:v", encoder,
@@ -94,9 +113,11 @@ class StreamServer:
             cmd.extend(["-preset", "ultrafast", "-tune", "stillimage", "-threads", "1"])
 
         cmd.extend([
-            "-r", "1",
-            "-g", "1",
-            "-b:v", "800k",
+            "-r", str(CARD_FPS),
+            # One keyframe per second: a joiner never waits more than ~1s for an
+            # entry point, without paying all-keyframes bitrate.
+            "-g", str(CARD_FPS),
+            "-b:v", "400k",
             "-c:a", "aac",
             "-b:a", "96k",
             "-f", "mpegts",
@@ -135,6 +156,7 @@ class StreamServer:
             cmd = self._get_ffmpeg_cmd(self.image_path)
             try:
                 self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                self._last_start_ts = time.time()
                 logger.info("Placeholder encoder started.")
             except Exception as e:
                 logger.error(f"Failed to start FFmpeg: {e}")
@@ -146,14 +168,37 @@ class StreamServer:
                 self._terminate_locked()
                 logger.info("Placeholder encoder stopped (idle).")
 
+    def _refresh_image_now(self):
+        """Re-render the card synchronously (no-op if nothing changed)."""
+        with self._render_lock:
+            try:
+                gen = PillowImageGen(out_path=self.image_path)
+                gen.get_active_streams()
+                gen.generate()
+            except Exception as e:
+                logger.error(f"Pre-start image refresh failed: {e}")
+
     def _ensure_running(self):
         """Start the encoder if it isn't already running, and cancel any pending idle-stop."""
         with self.process_lock:
             if self._stop_timer is not None:
                 self._stop_timer.cancel()
                 self._stop_timer = None
-            if self.process is None or self.process.poll() is not None:
-                self._start_ffmpeg()
+            needs_start = self.process is None or self.process.poll() is not None
+
+        if needs_start:
+            # Get the content right BEFORE spawning the encoder. Starting first
+            # and letting the updater re-render a couple of seconds later meant
+            # every fresh card view started an encoder, killed it, and started a
+            # second one -- about 3s of the ~4s a viewer waited for first bytes.
+            # Rendering first makes the updater's follow-up a no-op, because
+            # generate() returns False when the signature is unchanged.
+            # Deliberately done OUTSIDE process_lock: rendering can fetch channel
+            # logos over HTTP, and the broadcaster takes that lock every pass.
+            self._refresh_image_now()
+            with self.process_lock:
+                if self.process is None or self.process.poll() is not None:
+                    self._start_ffmpeg()
 
     def _schedule_idle_stop(self):
         with self.process_lock:
@@ -243,6 +288,15 @@ class StreamServer:
             try:
                 gen = PillowImageGen(out_path=self.image_path)
                 if gen.get_active_streams() or signaled:
+                    with self.process_lock:
+                        running = self.process is not None and self.process.poll() is None
+                    if running and (time.time() - self._last_start_ts) < MIN_ENCODER_RESTART_INTERVAL:
+                        # Too soon to restart. Skip the render as well, so the
+                        # change signature stays undetected and this same change
+                        # is picked up again on the next pass -- rather than
+                        # being consumed here and silently never shown.
+                        logger.debug("Content changed but encoder restarted recently; deferring.")
+                        continue
                     if gen.generate():
                         # Only restart the encoder if it's actually running (i.e.
                         # someone is watching). This is rare -- only when the set

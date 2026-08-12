@@ -23,9 +23,35 @@ class TooManyStreams:
     STREAM_NAME = 'TooManyStreams'
     TMS_MAXED_TTL_SEC = 30
     TMS_MAXED_COUNTER = 1
-    
+
+    # How the PROXY should read our card back off :1337. A channel's own profile
+    # is tuned for real sources -- on prod that's an h264_nvenc 1080p 7Mbit
+    # transcode -- and applying it to the card costs an NVENC session and, far
+    # worse, seconds of ffmpeg probing. ffmpeg's -analyzeduration counts STREAM
+    # time and -re pins that to wall-clock, so the default 5s probe literally
+    # cost 5s of viewer wait; when it overran the channel profile's -rw_timeout,
+    # ffmpeg reported "Connection timed out" and retried, which is where a cold
+    # fall-to-card spent 12-47s. Our card's format is fixed and known, so a
+    # modest probe is safe, and -c copy keeps the card off the GPU entirely.
+    # (See also CARD_FPS in StreamServer -- the probe budget and the card's
+    # frame rate have to be chosen together.)
+    CARD_PROFILE_NAME = 'TMS Card (copy, fast probe)'
+    CARD_PROFILE_COMMAND = 'ffmpeg'
+    # +discardcorrupt is load-bearing, not defensive dressing: restarting the
+    # card encoder (new content) resets its MPEG-TS timestamps to zero, and a
+    # -c copy reader sees that as a backward DTS jump -- "Packet corrupt ...
+    # corrupt input packet" -- and drops the stream. Re-encoding used to mask
+    # this; copying does not. Pair it with the restart rate-limit in
+    # StreamServer, which keeps those discontinuities rare in the first place.
+    CARD_PROFILE_PARAMETERS = (
+        '-probesize 256k -analyzeduration 1000000 -fflags +genpts+discardcorrupt '
+        '-user_agent {userAgent} -i {streamUrl} -c copy -f mpegts pipe:1'
+    )
+
     REFRESH_SIGNAL = threading.Event()
     _stream_manager_filter_installed = False
+    _card_profile_id = None
+    _card_stream_id = None
 
     class _TmsStreamInfoFilter(logging.Filter):
         """
@@ -126,6 +152,90 @@ class TooManyStreams:
             return Stream.objects.create(**data)
 
     @staticmethod
+    def get_card_stream_id():
+        """Id of the card Stream row, cached -- this sits on the tune hot path."""
+        if TooManyStreams._card_stream_id is None:
+            try:
+                TooManyStreams._card_stream_id = TooManyStreams.get_stream().id
+            except Exception:
+                return None  # not created yet; don't cache the miss
+        return TooManyStreams._card_stream_id
+
+    @staticmethod
+    def get_card_stream_profile():
+        """The StreamProfile the proxy should use while it is reading our card.
+
+        Created once, then left alone: it shows up in the Dispatcharr UI like any
+        other profile, so an operator who tunes it keeps their edit.
+        """
+        from core.models import StreamProfile
+
+        if TooManyStreams._card_profile_id is not None:
+            profile = StreamProfile.objects.filter(id=TooManyStreams._card_profile_id).first()
+            if profile:
+                return profile
+            TooManyStreams._card_profile_id = None  # deleted underneath us
+
+        profile, created = StreamProfile.objects.get_or_create(
+            name=TooManyStreams.CARD_PROFILE_NAME,
+            defaults={
+                'command': TooManyStreams.CARD_PROFILE_COMMAND,
+                'parameters': TooManyStreams.CARD_PROFILE_PARAMETERS,
+                'is_active': True,
+            },
+        )
+        if created:
+            logger.info("TooManyStreams: created stream profile '%s'", TooManyStreams.CARD_PROFILE_NAME)
+        TooManyStreams._card_profile_id = profile.id
+        return profile
+
+    @staticmethod
+    def _is_serving_card(channel) -> bool:
+        """Is this channel currently pointed at the card?
+
+        get_stream() runs before get_stream_profile() on the same Channel
+        instance (ts_proxy/url_utils.py:85 then :114), so the flag it leaves
+        behind is the cheapest possible answer. Other call sites can reach
+        get_stream_profile() without that, so fall back to the Redis reservation.
+        """
+        flag = getattr(channel, "_tms_serving_card", None)
+        if flag is not None:
+            return flag
+
+        card_id = TooManyStreams.get_card_stream_id()
+        if card_id is None:
+            return False
+        try:
+            stream_id_bytes = RedisClient.get_client().get(f"channel_stream:{channel.id}")
+            return bool(stream_id_bytes) and int(stream_id_bytes) == card_id
+        except Exception:
+            return False
+
+    @staticmethod
+    def install_get_stream_profile_override():
+        """Serve the card with a cheap, fast-probing profile instead of the channel's."""
+        from apps.channels.models import Channel
+
+        if getattr(Channel, "_orig_get_stream_profile", None) is not None:
+            return
+        Channel._orig_get_stream_profile = Channel.get_stream_profile
+
+        def _wrapped_get_stream_profile(self):
+            if TooManyStreams._is_serving_card(self):
+                try:
+                    profile = TooManyStreams.get_card_stream_profile()
+                    if profile and profile.is_active:
+                        return profile
+                except Exception as e:
+                    logger.warning(
+                        "TooManyStreams: could not resolve the card profile, using the channel's: %s", e
+                    )
+            return Channel._orig_get_stream_profile(self)
+
+        Channel.get_stream_profile = _wrapped_get_stream_profile
+        logger.info("TooManyStreams: installed get_stream_profile override for the card.")
+
+    @staticmethod
     def add_stream_to_channel(channel_id:int) -> None:
         custom_stream = TooManyStreams.get_or_create_stream()
         try:
@@ -205,6 +315,7 @@ class TooManyStreams:
                         stream_id = int(stream_id_bytes)
                         profile_id_bytes = redis_client.get(f"stream_profile:{stream_id}")
                         if profile_id_bytes:
+                            self._tms_serving_card = (stream_id == TooManyStreams.get_card_stream_id())
                             return stream_id, int(profile_id_bytes), None
                     except (ValueError, TypeError): pass
 
@@ -233,6 +344,7 @@ class TooManyStreams:
                             if profile.max_streams > 0: redis_client.incr(profile_connections_key)
                             
                             TooManyStreams.trigger_refresh()
+                            self._tms_serving_card = False
                             return stream.id, profile.id, None
                         else:
                             has_streams_but_maxed_out = True
@@ -246,6 +358,7 @@ class TooManyStreams:
                     # Return our custom stream
                     try:
                         custom_stream = TooManyStreams.get_stream()
+                        self._tms_serving_card = True
                         return custom_stream.id, None, None
                     except: pass
 

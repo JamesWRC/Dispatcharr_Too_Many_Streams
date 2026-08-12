@@ -36,7 +36,7 @@ except Exception as e:
 
 class Plugin:
     name = "too_many_streams"
-    version = "2.1.3"
+    version = "2.2.4"
     description = "Handles scenarios where too many streams are open and what users see."
     initialized = False
 
@@ -205,6 +205,7 @@ class Plugin:
         # and the ts_proxy.stream_manager logger can fire in the web process and in
         # Celery workers alike.
         TooManyStreams.install_get_stream_override()
+        TooManyStreams.install_get_stream_profile_override()
         TooManyStreams.install_stream_manager_log_filter()
 
         # The HTTP server, however, must be hosted by exactly ONE process. The plugin
