@@ -38,6 +38,20 @@ MIN_ENCODER_RESTART_INTERVAL = 30
 # rate. 10 fps keeps each frame small and gives a joiner ~10 chances a second.
 CARD_FPS = 10
 
+# Transport-stream rate, padded with null packets by the mpegts muxer.
+#
+# This is a LATENCY knob and it is not intuitive. ts_proxy publishes to clients
+# only in whole BUFFER_CHUNK_SIZE blocks (188*1361 = 250KB, apps/proxy/config.py),
+# so nobody sees a single byte until 250KB has accumulated -- first-byte latency is
+# 250KB / bitrate. A still image compresses so well that the card ran at ~570kbit,
+# needing ~3.6s to fill one chunk, which was most of the 4-6s a viewer waited. Real
+# streams never show this because they fill 250KB in well under a second.
+#
+# Padding the MUX rather than raising -b:v is the cheap way to fix it: null-packet
+# stuffing costs almost nothing, whereas making x264 emit more real bits for the
+# same still image measured 15% -> 22% of a core. Loopback bandwidth is free.
+CARD_MUXRATE = 4_000_000
+
 
 class StreamServer:
     """
@@ -121,6 +135,7 @@ class StreamServer:
             "-c:a", "aac",
             "-b:a", "96k",
             "-f", "mpegts",
+            "-muxrate", str(CARD_MUXRATE),
             "pipe:1",
         ])
         return cmd
