@@ -1,3 +1,9 @@
+> [!WARNING]
+> **This plugin is currently broken on Dispatcharr 0.25.0 and newer**, and has been
+> observed causing HTTP 500 responses across the whole Dispatcharr instance.
+> Disable it in the Dispatcharr UI until this is resolved.
+> See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the diagnosis and fix checklist.
+
 # About
 
 When the configured max stream limit is reached. Show a highly configurable display to users.
