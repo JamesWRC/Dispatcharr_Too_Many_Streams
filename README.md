@@ -1,8 +1,8 @@
 > [!WARNING]
-> **This plugin is currently broken on Dispatcharr 0.25.0 and newer**, and has been
-> observed causing HTTP 500 responses across the whole Dispatcharr instance.
-> Disable it in the Dispatcharr UI until this is resolved.
-> See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the diagnosis and fix checklist.
+> **This plugin is currently broken on Dispatcharr 0.25.0 and newer.** It fails to
+> import (`apps.proxy.ts_proxy` was renamed to `apps.proxy.live_proxy`) and does
+> nothing. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the diagnosis and the fix
+> checklist required before re-enabling it.
 
 # About
 

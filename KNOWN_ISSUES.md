@@ -1,9 +1,15 @@
 # Known Issues — maintainer notes
 
-> **Status: BROKEN on Dispatcharr >= 0.25.0.** The plugin fails to import, and the
-> repeated failed imports have been observed taking the whole Dispatcharr instance
-> down with HTTP 500s on almost every endpoint. Disabling the plugin in the
-> Dispatcharr UI resolves the 500s.
+> **Status: BROKEN on Dispatcharr >= 0.25.0.** The plugin fails to import and is
+> non-functional. It must be ported before it can be re-enabled.
+>
+> **It is not, however, a cause of instance-wide HTTP 500s.** This file originally
+> claimed it was. That was tested on 2026-08-17 by disabling the plugin and
+> restarting: the 500s persisted, so the plugin is ruled out. This matches the
+> mechanics — Dispatcharr's loader isolates plugin import failures
+> (`loader.py:243`), so a plugin that dies at import has no reach beyond its own
+> registry entry. See §2 for the disproven hypothesis, kept because the
+> logging-handler leak it describes is a real bug worth fixing on its own.
 >
 > Investigated 2026-08-17 against Dispatcharr `0.29.0`. Line references below are
 > to upstream `Dispatcharr/Dispatcharr` at that version.
@@ -36,11 +42,16 @@ Confirm in the UI (plugin shows as **not loaded**) or in `docker logs dispatchar
 Error importing module ... ModuleNotFoundError: No module named 'apps.proxy.ts_proxy'
 ```
 
-## 2. Why a failed import takes down the whole instance
+## 2. Logging handler leak (real bug — but NOT a cause of instance-wide 500s)
 
-Dispatcharr's loader *does* isolate import failures — `loader.py:243` catches the
-exception and substitutes a `loaded=False` placeholder. On its own that should be
-harmless. The damage comes from what we do **before** the failing import:
+> **Disproven as an outage cause.** This section originally argued the repeated
+> failed imports were taking the instance down. Disabling the plugin and
+> restarting did **not** clear the 500s, so that is wrong. The leak below is
+> still a genuine bug — it wastes fds and disk — but it is not an outage.
+
+Dispatcharr's loader isolates import failures — `loader.py:243` catches the
+exception and substitutes a `loaded=False` placeholder. What follows is what we
+do **before** the failing import, which survives that isolation:
 
 ```python
 # plugin.py:15-17 — runs at module top level, before the try block
@@ -64,13 +75,9 @@ Consequences, all cumulative and never reset until the container restarts:
   usual 1024 limit the worker can no longer open sockets to Postgres or Redis.
 
 Disabling the plugin stops both, because `loader.py:204` short-circuits *before*
-`_load_plugin()` for disabled plugins — the module is never imported at all. That
-matches the observed behaviour exactly.
+`_load_plugin()` for disabled plugins — the module is never imported at all.
 
-**This is the leading explanation, not a confirmed one.** To verify before/after the
-fix: `ls -l /data/plugins/too_many_streams/debug.log` and `df -h /data`.
-
-**Fix regardless of root cause:** build the logger inside `initialize()`, guard with
+**Fix:** build the logger inside `initialize()`, guard with
 `if not logger.handlers:`, and log to stdout / Dispatcharr's logger rather than a
 file inside the plugin directory.
 
