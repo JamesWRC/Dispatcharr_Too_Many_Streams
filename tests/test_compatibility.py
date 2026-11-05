@@ -122,6 +122,7 @@ class Compatibility(unittest.TestCase):
         self.url_module = module('apps.proxy.live_proxy.url_utils', generate_stream_url=generate)
         self.views = module('apps.proxy.live_proxy.views', generate_stream_url=generate)
         self.models = module('apps.channels.models', Channel=Channel, Stream=self.Stream, ChannelStream=Mock())
+        self.models.ChannelStream.objects.filter.return_value.exists.return_value = False
         modules = {
             'apps.channels.models': self.models,
             'apps.proxy.live_proxy.url_utils': self.url_module,
@@ -256,6 +257,50 @@ class Compatibility(unittest.TestCase):
         self.TMS._server.is_running = False
         self.install()
         self.assertEqual(self.views.generate_stream_url('1')[5], FULL)
+
+    def test_multiworker_peer_attaches_hooks_without_listener(self):
+        # Simulate a second process: port owned by a healthy peer, no local server.
+        import errno
+        self.install()
+        self.assertTrue(hasattr(self.Channel.get_stream, '__wrapped__'))
+        self.TMS.uninstall_get_stream_override()
+        owner_server = self.TMS._server
+        self.TMS._server = None
+        server_mod = sys.modules['tms_test.src.StreamServer']
+        busy = OSError(errno.EADDRINUSE, 'Address already in use')
+        failing = Mock()
+        failing.start.side_effect = busy
+        server_mod.StreamServer.return_value = failing
+        self.addCleanup(setattr, server_mod.StreamServer, 'return_value', server_mod.StreamServer.return_value)
+        healthy = patch.object(self.TMS, '_peer_healthy', return_value=True)
+        healthy.start()
+        self.addCleanup(healthy.stop)
+        self.TMS.start(None, '127.0.0.1', 1337)
+        self.assertIsNone(self.TMS._server, 'peer must not own/stop a listener')
+        self.assertTrue(hasattr(self.Channel.get_stream, '__wrapped__'), 'peer hooks installed')
+        # Warning path still fires through the shared listener.
+        self.response = (None, None, FULL, False)
+        result = self.views.generate_stream_url('1')
+        self.assertEqual(result[6], self.stream.id, result)
+        self.assertIsNone(result[1], 'warning must not claim a provider profile')
+        self.TMS.stop()  # peer stop must not kill the owner's listener
+        self.assertTrue(owner_server.is_running)
+
+    def test_multiworker_peer_fails_when_listener_unhealthy(self):
+        import errno
+        if hasattr(self.Channel.get_stream, '__wrapped__'):
+            self.TMS.uninstall_get_stream_override()
+        self.TMS._server = None
+        server_mod = sys.modules['tms_test.src.StreamServer']
+        busy = OSError(errno.EADDRINUSE, 'Address already in use')
+        failing = Mock()
+        failing.start.side_effect = busy
+        server_mod.StreamServer.return_value = failing
+        self.addCleanup(setattr, server_mod.StreamServer, 'return_value', server_mod.StreamServer.return_value)
+        with patch.object(self.TMS, '_peer_healthy', return_value=False):
+            with self.assertRaises(OSError):
+                self.TMS.start(None, '127.0.0.1', 1337)
+        self.assertFalse(hasattr(self.Channel.get_stream, '__wrapped__'))
 
     def test_stale_native_allocation_identities_never_attached_to_warning(self):
         self.response = (None, None, FULL, False)

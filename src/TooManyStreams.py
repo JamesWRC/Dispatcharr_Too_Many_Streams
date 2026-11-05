@@ -136,7 +136,11 @@ class TooManyStreams:
                     if selection != (None, None, owner.CAPACITY_ERROR, False):
                         return result
                     server = owner._server
-                    if server is None or not server.is_running:
+                    if server is None:
+                        # Multiworker peer: verify the shared listener is alive.
+                        if not owner._peer_healthy(*owner._bind_address()):
+                            return result
+                    elif not server.is_running:
                         return result
                     try:
                         profile = channel.get_stream_profile()
@@ -158,7 +162,9 @@ class TooManyStreams:
                         # Native exceptions may contain credential-bearing URLs.
                         logger.warning('Could not prepare capacity warning (%s); retaining native failure', type(exc).__name__)
                         return result
-                    if not state['enabled'] or not server.is_running:
+                    if not state['enabled']:
+                        return result
+                    if server is not None and not server.is_running:
                         return result
                     owner.REFRESH_SIGNAL.set()
                     return warning.url, None, transcode, profile_id, False, None, warning.id
@@ -218,10 +224,36 @@ class TooManyStreams:
                 server.start()  # Bind synchronously; no hooks on bind/FFmpeg failure.
                 TooManyStreams._server = server
                 TooManyStreams.install_get_stream_override()
+            except OSError as exc:
+                # Multiworker hosts (uwsgi/celery/daphne) run discovery in every
+                # process. The first worker owns the shared loopback port; the
+                # rest attach hooks and share its stream URL. Fail only if no
+                # healthy instance answers.
+                server.stop()
+                if exc.errno not in (48, 98) or not TooManyStreams._peer_healthy(host, port):
+                    TooManyStreams._server = None
+                    raise
+                logger.info('Port %s already served by another TooManyStreams worker; attaching hooks without a local listener', port)
+                TooManyStreams._server = None  # Never stop a peer's server.
+                TooManyStreams.install_get_stream_override()
             except Exception:
                 TooManyStreams._server = None
                 server.stop()
                 raise
+
+    @staticmethod
+    def _bind_address():
+        from .TooManyStreamsConfig import TooManyStreamsConfig
+        return TooManyStreamsConfig.get_host_and_port()
+
+    @staticmethod
+    def _peer_healthy(host, port, timeout=3):
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f'http://{host}:{port}/stream.ts', timeout=timeout) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
 
     @staticmethod
     def stop():
