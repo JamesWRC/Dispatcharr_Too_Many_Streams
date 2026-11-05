@@ -95,7 +95,7 @@ class TooManyStreamsConfig:
 
     @staticmethod
     def get_host_and_port() -> tuple[str, int]:
-        _host = os.environ.get("TMS_HOST", "0.0.0.0")
+        _host = os.environ.get("TMS_HOST", "127.0.0.1")
         _port = int(os.environ.get("TMS_PORT", 1337))
         return (_host, _port)
     

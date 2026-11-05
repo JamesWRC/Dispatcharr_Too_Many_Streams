@@ -9,8 +9,9 @@ from io import BytesIO
 from hashlib import md5
 
 from apps.channels.models import Channel
-from apps.proxy.ts_proxy.server import ProxyServer
-from apps.proxy.ts_proxy.channel_status import ChannelStatus
+from apps.proxy.live_proxy.server import ProxyServer
+from apps.proxy.live_proxy.channel_status import ChannelStatus
+from apps.proxy.live_proxy.redis_keys import RedisKeys
 
 from .TooManyStreamsConfig import TooManyStreamsConfig
 
@@ -29,12 +30,14 @@ class PillowImageGen:
     def __init__(
         self,
         out_path: str = DEFAULT_OUT_FILE,
+        stop_event=None,
     ):
         config = TooManyStreamsConfig.get_config()
         self.title = config.stream_title
         self.description = config.stream_description
         self.html_cols = max(1, int(config.stream_channel_cols))
         self.out_path = out_path
+        self.stop_event = stop_event
         self.active_streams: list[tuple[str, str, str]] = []
         self._current_uuids = []
 
@@ -44,7 +47,8 @@ class PillowImageGen:
         os.makedirs(CACHE_DIR, exist_ok=True)
 
     def _get_cached_logo(self, url: str) -> Image.Image:
-        if not url: return None
+        if not url or (self.stop_event is not None and self.stop_event.is_set()):
+            return None
         hashed_url = md5(url.encode()).hexdigest()
         cache_path = os.path.join(CACHE_DIR, hashed_url)
         
@@ -78,7 +82,7 @@ class PillowImageGen:
         """
         try:
             proxy_server = ProxyServer.get_instance()
-            channel_pattern = "ts_proxy:channel:*:metadata"
+            channel_pattern = RedisKeys.channel_metadata("*")
             cursor = 0
             active_uuids = []
             
@@ -86,7 +90,9 @@ class PillowImageGen:
                 cursor, keys = proxy_server.redis_client.scan(cursor, match=channel_pattern)
                 for key in keys:
                     try:
-                        m = re.search(r"ts_proxy:channel:(.*):metadata", key.decode("utf-8"))
+                        key = key.decode("utf-8") if isinstance(key, bytes) else key
+                        prefix, suffix = RedisKeys.channel_metadata("*").split("*")
+                        m = re.fullmatch(re.escape(prefix) + r"(.*)" + re.escape(suffix), key)
                         if m: active_uuids.append(m.group(1))
                     except: continue
                 if cursor == 0: break
@@ -130,7 +136,7 @@ class PillowImageGen:
             has_changed = self._current_uuids != PillowImageGen._last_active_uuids
             return has_changed
             
-        except Exception as e:
+        except Exception:
             self.logger.error("Error in get_active_streams", exc_info=True)
             return True # Force generation on error to be safe
 
@@ -239,6 +245,6 @@ class PillowImageGen:
             final_img.save(self.out_path, "JPEG", quality=92)
             PillowImageGen._last_active_uuids = self._current_uuids
             return True
-        except Exception as e:
+        except Exception:
             self.logger.error("Generation failed", exc_info=True)
             return False

@@ -1,268 +1,282 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Delegate allocation to Dispatcharr; add warning only at URL resolution.
+
+A (warning_stream_id, None, None, False) Channel result is NOT supported by
+Dispatcharr: generate_stream_url requires a real M3U profile. Consequently the
+Channel hook is an observer only and preserves every native result verbatim.
+"""
+from contextvars import ContextVar
+from functools import wraps
+import inspect
 import logging
-import os
 import threading
-import re
-import time
 
 from apps.channels.models import Channel, ChannelStream, Stream
-from apps.proxy.ts_proxy.server import ProxyServer
-from apps.proxy.ts_proxy.services.channel_service import ChannelService
+from apps.m3u.connection_pool import (
+    get_credential_connection_count,
+    get_profile_connection_count,
+)
 from core.utils import RedisClient
+from apps.proxy.live_proxy.redis_keys import RedisKeys
+from apps.proxy.live_proxy.constants import ChannelMetadataField
 
 from .TooManyStreamsConfig import TooManyStreamsConfig
-from .exceptions import TMS_CustomStreamNotFound
 from .StreamServer import StreamServer
 
 logger = logging.getLogger('plugins.too_many_streams.TooManyStreams')
-logger.setLevel(os.environ.get("TMS_LOG_LEVEL", os.environ.get("DISPATCHARR_LOG_LEVEL", "INFO")).upper())
+
 
 class TooManyStreams:
-
     STREAM_NAME = 'TooManyStreams'
-    TMS_MAXED_TTL_SEC = 30
-    TMS_MAXED_COUNTER = 1
-    
+    CAPACITY_ERROR = 'All active M3U profiles have reached maximum connection limits'
+    SUPPORTED_VERSIONS = {'0.31.0', '0.33.0'}
     REFRESH_SIGNAL = threading.Event()
-    _stream_manager_filter_installed = False
-
-    class _TmsStreamInfoFilter(logging.Filter):
-        """
-        Suppress noisy stream-manager info lines only for active TooManyStreams channels.
-        Ignores logs that spam: 
-            2026-03-15 03:43:01,741 INFO ts_proxy.stream_manager Stream info for channel ded35132-7950-4e82-b628-60eecad7ce05: [aist#0:1/aac @ 0x562b7fcf8040] timestamp discontinuity (stream id=257): 35240067, new offset= -93629957761
-        """
-
-        _MSG_PATTERN = re.compile(r"Stream info for channel ([^:]+):")
-
-        def __init__(self, ttl_sec: int = 10):
-            super().__init__()
-            self.ttl_sec = ttl_sec
-            self._cache = {}
-
-        def filter(self, record: logging.LogRecord) -> bool:
-            try:
-                msg = record.getMessage()
-                if "Stream info for channel " not in msg:
-                    return True
-
-                match = self._MSG_PATTERN.search(msg)
-                if not match:
-                    return True
-
-                channel_id = match.group(1)
-                if self._is_tms_channel(channel_id):
-                    return False
-            except Exception:
-                # Never block logs if filter logic fails.
-                return True
-            return True
-
-        def _is_tms_channel(self, channel_id: str) -> bool:
-            now = time.time()
-            cached = self._cache.get(channel_id)
-            if cached and cached[0] > now:
-                return cached[1]
-
-            is_tms = False
-            try:
-                redis_client = RedisClient.get_client()
-                metadata_key = f"ts_proxy:channel:{channel_id}:metadata"
-                stream_id_raw = redis_client.hget(metadata_key, "stream_id")
-                if stream_id_raw:
-                    stream_id = int(stream_id_raw.decode("utf-8") if isinstance(stream_id_raw, bytes) else stream_id_raw)
-                    stream_url = Stream.objects.filter(id=stream_id).values_list("url", flat=True).first()
-                    is_tms = bool(stream_url and stream_url == TooManyStreamsConfig.get_stream_url())
-            except Exception:
-                is_tms = False
-
-            self._cache[channel_id] = (now + self.ttl_sec, is_tms)
-            return is_tms
+    _lock = threading.RLock()
+    _server = None
 
     @staticmethod
-    def install_stream_manager_log_filter():
-        if TooManyStreams._stream_manager_filter_installed:
-            return
-
-        target_logger = logging.getLogger("ts_proxy.stream_manager")
-        target_logger.addFilter(TooManyStreams._TmsStreamInfoFilter())
-        TooManyStreams._stream_manager_filter_installed = True
-        logger.info("TooManyStreams: Installed ts_proxy.stream_manager filter for TMS stream-info noise")
-
-    @staticmethod
-    def check_requirements_met() -> bool:
+    def check_requirements_met():
+        """Reject unreviewed host contracts before installing any hooks."""
+        from version import __version__
+        if __version__ not in TooManyStreams.SUPPORTED_VERSIONS:
+            raise RuntimeError(
+                f'Unsupported Dispatcharr {__version__}; supported: 0.31.0, 0.33.0'
+            )
+        parameters = inspect.signature(Channel.get_stream).parameters
+        if not getattr(Channel, '_tms_hook_state', None) and not {
+            'requester', 'allowed_m3u_profiles'
+        }.issubset(parameters):
+            # Test doubles/wrappers can retain the contract through __wrapped__.
+            if not any(p.kind == p.VAR_KEYWORD for p in parameters.values()):
+                raise RuntimeError('Unsupported Dispatcharr Channel.get_stream contract')
+        if getattr(Channel, '_orig_get_stream', None):
+            raise RuntimeError('Legacy TooManyStreams hook detected; restart Dispatcharr before enabling')
         return True
 
     @staticmethod
-    def install_requirements() -> None:
-        try:
-            import subprocess
-            subprocess.check_call(["pip", "install", "-r", os.path.join(os.path.dirname(__file__), "..", "requirements.txt")])
-            logger.info("TooManyStreams: Installed requirements.")
-        except Exception as e:
-            logger.error(f"TooManyStreams: Failed to install requirements: {e}")
+    def get_or_create_stream():
+        # This row is for native proxy metadata only. NEVER attach it to channels
+        # or reserve its automatically assigned Custom M3U account/profile.
+        stream, _ = Stream.objects.get_or_create(
+            name=TooManyStreams.STREAM_NAME,
+            url=TooManyStreamsConfig.get_stream_url(),
+            defaults={'is_custom': True, 'channel_group': None, 'stream_profile_id': None},
+        )
+        return stream
 
     @staticmethod
-    def get_stream() -> Stream:
-        stream:dict = Stream.objects.values('id', 'name', 'url').filter(
-            name=TooManyStreams.STREAM_NAME, url=TooManyStreamsConfig.get_stream_url())
-        if not stream:
-            raise TMS_CustomStreamNotFound("TooManyStreams: Stream not found.")
-        return Stream.objects.get(id=stream[0]['id'])
-    
-    @staticmethod
-    def get_or_create_stream() -> Stream:
-        try:
-            return TooManyStreams.get_stream()
-        except TMS_CustomStreamNotFound:
-            data = {
-                'name': TooManyStreams.STREAM_NAME,
-                'url': TooManyStreamsConfig.get_stream_url(),
-                'is_custom': True,
-                'channel_group': None,
-                'stream_profile_id': None,
-            }
-            return Stream.objects.create(**data)
+    def _confirmed_capacity(channel):
+        """Read-only corroboration of the native capacity failure.
 
-    @staticmethod
-    def add_stream_to_channel(channel_id:int) -> None:
-        custom_stream = TooManyStreams.get_or_create_stream()
-        try:
-            channel = Channel.objects.get(id=channel_id)
-            if custom_stream not in channel.streams.all():
-                ChannelStream.objects.create(channel=channel, stream_id=custom_stream.id, order=9999)
-        except Exception as e:
-            logger.error(
-                "TooManyStreams: Failed to add custom stream to channel %s: %s",
-                channel_id,
-                e,
-                exc_info=True,
-            )
-
-    @staticmethod   
-    def remove_stream_from_channel(channel_id:int) -> None:
-        custom_stream = TooManyStreams.get_or_create_stream()
-        try:
-            channel = Channel.objects.get(id=channel_id)
-            if custom_stream in channel.streams.all():
-                channel.streams.remove(custom_stream.id)
-                channel.save()
-                proxy_server = ProxyServer.get_instance()
-                ChannelService.stop_channel(str(channel.uuid))
-                proxy_server.stop_channel(channel.uuid)
-        except Exception as e:
-            logger.error(
-                "TooManyStreams: Failed to remove custom stream from channel %s: %s",
-                channel_id,
-                e,
-                exc_info=True,
-            )
-
-    @staticmethod
-    def mark_streams_maxed(channel_id) -> None:
-        channel_id = str(channel_id)
-        redis_client = RedisClient.get_client()
-        key = f"tms:maxed_out:{channel_id}"
-        redis_client.incr(key)
-        redis_client.expire(key, TooManyStreams.TMS_MAXED_TTL_SEC)
-
-    @staticmethod
-    def is_streams_maxed(channel_id) -> bool:
-        channel_id = str(channel_id)
-        redis_client = RedisClient.get_client()
-        key = f"tms:maxed_out:{channel_id}"
-        try:
-            val = int(redis_client.get(key) or 0)
-        except: val = 0
-        
-        is_maxed = val >= TooManyStreams.TMS_MAXED_COUNTER
-        if is_maxed: TooManyStreams.add_stream_to_channel(channel_id)
-        else: TooManyStreams.remove_stream_from_channel(channel_id)
-        return is_maxed
-
-    @staticmethod
-    def trigger_refresh():
-        TooManyStreams.REFRESH_SIGNAL.set()
+        Never reserve/release here. A full profile counter is sufficient;
+        otherwise consult the native shared-credential counter. If capacity
+        changed after native selection, preserve the native failure.
+        """
+        redis = RedisClient.get_client()
+        # The native view can recover assignment/profile IDs from old keys, and
+        # native teardown can release a profile from metadata. Never lend those
+        # identities to an internal warning; ambiguous stale state fails closed.
+        if (redis.get(f'channel_stream:{channel.id}') is not None
+                or redis.hget(RedisKeys.channel_metadata(str(channel.uuid)),
+                              ChannelMetadataField.M3U_PROFILE) is not None):
+            return False
+        found = False
+        for stream in channel.streams.all().order_by('channelstream__order'):
+            account = stream.m3u_account
+            if not account or not account.is_active:
+                continue
+            profiles = list(account.profiles.filter(is_active=True))
+            if not any(profile.is_default for profile in profiles):
+                continue
+            for profile in profiles:
+                found = True
+                if profile.max_streams <= 0:
+                    return False
+                if (get_profile_connection_count(profile, redis) < profile.max_streams
+                        and get_credential_connection_count(profile, redis) < profile.max_streams):
+                    return False
+        return found
 
     @staticmethod
     def install_get_stream_override():
-        from apps.channels.models import Channel 
-        if getattr(Channel, "_orig_get_stream", None) is None:
-            Channel._orig_get_stream = Channel.get_stream
-            
-            def _wrapped_get_stream(self, *args, **kwargs):
-                redis_client = RedisClient.get_client()
-                error_reason = None
+        """Install observer + URL wrapper, including already-imported aliases."""
+        import sys
+        from apps.proxy.live_proxy import url_utils
+        with TooManyStreams._lock:
+            if getattr(Channel, '_tms_hook_state', None):
+                return
+            TooManyStreams.check_requirements_met()
+            owner = TooManyStreams
+            observed = ContextVar('tms_native_selection', default=None)
+            original = Channel.get_stream
+            generate = url_utils.generate_stream_url
+            state = {'enabled': True, 'patches': [], 'owner': owner}
 
-                if not self.streams.exists():
-                    return None, None, "No streams assigned to channel"
+            @wraps(original)
+            def get_stream(self, *args, **kwargs):
+                result = original(self, *args, **kwargs)
+                observations = observed.get()
+                if observations is not None:
+                    observations.append((self, result))
+                return result
 
-                # 1. Check if a stream is already active for this channel (Restore session logic)
-                stream_id_bytes = redis_client.get(f"channel_stream:{self.id}")
-                if stream_id_bytes:
+            @wraps(generate)
+            def generate_stream_url(*args, **kwargs):
+                observations = []
+                token = observed.set(observations)
+                try:
+                    result = generate(*args, **kwargs)
+                    # Exact, pinned error contract only; never mask exceptions,
+                    # URL-transform failures, inactive accounts or authorization.
+                    if (not state['enabled'] or len(observations) != 1
+                            or len(result) != 7 or result[0] is not None
+                            or result[4] is not False
+                            or result[5] != owner.CAPACITY_ERROR):
+                        return result
+                    channel, selection = observations[0]
+                    if selection != (None, None, owner.CAPACITY_ERROR, False):
+                        return result
+                    server = owner._server
+                    if server is None:
+                        # Multiworker peer: verify the shared listener is alive.
+                        if not owner._peer_healthy(*owner._bind_address()):
+                            return result
+                    elif not server.is_running:
+                        return result
                     try:
-                        stream_id = int(stream_id_bytes)
-                        profile_id_bytes = redis_client.get(f"stream_profile:{stream_id}")
-                        if profile_id_bytes:
-                            return stream_id, int(profile_id_bytes), None
-                    except (ValueError, TypeError): pass
+                        profile = channel.get_stream_profile()
+                        # Loopback URL must never be redirected to a viewer. Do
+                        # not reinterpret requester-specific redirect restrictions.
+                        if profile is None or profile.is_redirect():
+                            return result
+                        if not owner._confirmed_capacity(channel):
+                            return result
+                        warning = owner.get_or_create_stream()
+                        if RedisClient.get_client().get(f'stream_profile:{warning.id}') is not None:
+                            return result
+                        override = kwargs.get('override_stream_profile_id')
+                        if override is None and len(args) > 3:
+                            override = args[3]
+                        transcode = False if override is not None else not profile.is_proxy()
+                        profile_id = override if override is not None else profile.id
+                    except Exception as exc:
+                        # Native exceptions may contain credential-bearing URLs.
+                        logger.warning('Could not prepare capacity warning (%s); retaining native failure', type(exc).__name__)
+                        return result
+                    if not state['enabled']:
+                        return result
+                    if server is not None and not server.is_running:
+                        return result
+                    owner.REFRESH_SIGNAL.set()
+                    return warning.url, None, transcode, profile_id, False, None, warning.id
+                finally:
+                    observed.reset(token)
 
-                # 2. Try to find an available stream
-                has_streams_but_maxed_out = False
-                has_active_profiles = False
+            # Existing from-import aliases otherwise continue calling the native
+            # resolver. Do not import views here (it imports this module's host).
+            targets = [(Channel, 'get_stream', original, get_stream)]
+            for name, mod in list(sys.modules.items()):
+                if name == 'apps.proxy.live_proxy' or name.startswith('apps.proxy.live_proxy.'):
+                    if mod is not None and getattr(mod, 'generate_stream_url', None) is generate:
+                        targets.append((mod, 'generate_stream_url', generate, generate_stream_url))
+            for obj, name, before, after in targets:
+                setattr(obj, name, after)
+                state['patches'].append((obj, name, before, after))
+            Channel._tms_hook_state = state
 
-                for stream in self.streams.all().order_by("channelstream__order"):
-                    m3u_account = stream.m3u_account
-                    if not m3u_account: continue
+    @staticmethod
+    def uninstall_get_stream_override():
+        with TooManyStreams._lock:
+            import sys
+            state = getattr(Channel, '_tms_hook_state', None)
+            if not state:
+                return
+            state['enabled'] = False
+            # Restore aliases imported after installation as well.
+            for modname, mod in list(sys.modules.items()):
+                if modname.startswith('apps.proxy.live_proxy.') and mod is not None:
+                    for _, name, before, after in state['patches']:
+                        if name == 'generate_stream_url' and getattr(mod, name, None) is after:
+                            setattr(mod, name, before)
+            for obj, name, before, after in reversed(state['patches']):
+                if getattr(obj, name, None) is after:
+                    setattr(obj, name, before)
+            del Channel._tms_hook_state
 
-                    profiles = m3u_account.profiles.all()
-                    # Ensure default profile is checked first
-                    sorted_profiles = sorted(profiles, key=lambda x: not x.is_default)
+    @staticmethod
+    def start(image_path=None, host='127.0.0.1', port=1337):
+        with TooManyStreams._lock:
+            TooManyStreams.check_requirements_met()
+            state = getattr(Channel, '_tms_hook_state', None)
+            if state:
+                TooManyStreams._server = state['owner']._server
+                return
+            if TooManyStreams._server is not None:
+                return
+            # Legacy associations would be selected as normal Custom streams and
+            # allocate fake upstream slots. Refuse rather than changing channels.
+            if ChannelStream.objects.filter(
+                stream__name=TooManyStreams.STREAM_NAME,
+                stream__is_custom=True,
+            ).exists():
+                raise RuntimeError('Remove legacy TooManyStreams channel associations before enabling')
+            server = StreamServer(host, port, image_path, TooManyStreams.REFRESH_SIGNAL)
+            try:
+                server.start()  # Bind synchronously; no hooks on bind/FFmpeg failure.
+                TooManyStreams._server = server
+                TooManyStreams.install_get_stream_override()
+            except OSError as exc:
+                # Multiworker hosts (uwsgi/celery/daphne) run discovery in every
+                # process. The first worker owns the shared loopback port; the
+                # rest attach hooks and share its stream URL. Fail only if no
+                # healthy instance answers.
+                server.stop()
+                if exc.errno not in (48, 98) or not TooManyStreams._peer_healthy(host, port):
+                    TooManyStreams._server = None
+                    raise
+                logger.info('Port %s already served by another TooManyStreams worker; attaching hooks without a local listener', port)
+                TooManyStreams._server = None  # Never stop a peer's server.
+                TooManyStreams.install_get_stream_override()
+            except Exception:
+                TooManyStreams._server = None
+                server.stop()
+                raise
 
-                    for profile in sorted_profiles:
-                        if not profile.is_active: continue
-                        has_active_profiles = True
+    @staticmethod
+    def _bind_address():
+        from .TooManyStreamsConfig import TooManyStreamsConfig
+        return TooManyStreamsConfig.get_host_and_port()
 
-                        profile_connections_key = f"profile_connections:{profile.id}"
-                        current_connections = int(redis_client.get(profile_connections_key) or 0)
+    @staticmethod
+    def _peer_healthy(host, port, timeout=3):
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f'http://{host}:{port}/stream.ts', timeout=timeout) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
 
-                        if profile.max_streams == 0 or current_connections < profile.max_streams:
-                            redis_client.set(f"channel_stream:{self.id}", stream.id)
-                            redis_client.set(f"stream_profile:{stream.id}", profile.id)
-                            if profile.max_streams > 0: redis_client.incr(profile_connections_key)
-                            
-                            TooManyStreams.trigger_refresh()
-                            return stream.id, profile.id, None
-                        else:
-                            has_streams_but_maxed_out = True
-
-                # 3. Handle maxed out scenario
-                if has_streams_but_maxed_out:
-                    if not TooManyStreams.is_streams_maxed(self.id):
-                        TooManyStreams.mark_streams_maxed(self.id)
-                        return None, None, "All M3U profiles have reached maximum connection limits"
-                    
-                    # Return our custom stream
-                    try:
-                        custom_stream = TooManyStreams.get_stream()
-                        return custom_stream.id, None, None
-                    except: pass
-
-                error_reason = "No compatible profile found" if has_active_profiles else "No active profiles found"
-                return None, None, error_reason
-
-            Channel.get_stream = _wrapped_get_stream
+    @staticmethod
+    def stop():
+        with TooManyStreams._lock:
+            state = getattr(Channel, '_tms_hook_state', None)
+            owner = state['owner'] if state else TooManyStreams
+            TooManyStreams.uninstall_get_stream_override()
+            server, owner._server = owner._server, None
+            TooManyStreams._server = None
+            if server is not None:
+                server.stop()
 
     @staticmethod
     def apply_to_all_channels():
-        for c in Channel.objects.all(): TooManyStreams.add_stream_to_channel(c.id)
+        # Retain the old action id, but no global mutation is needed anymore.
+        TooManyStreams.get_or_create_stream()
+        logger.info('Capacity fallback is automatic; no channel associations added')
 
     @staticmethod
     def remove_from_all_channels():
-        for c in Channel.objects.all(): TooManyStreams.remove_stream_from_channel(c.id)
-
-    @staticmethod
-    def stream_still_mpegts_http_thread(image_path=None, host="127.0.0.1", port=8081):
-        server = StreamServer(host=host, port=port, image_path=image_path, refresh_signal=TooManyStreams.REFRESH_SIGNAL)
-        server.start()
+        # Explicit migration action only. Never stop healthy channels or alter
+        # provider streams, priorities, permissions or native fallback order.
+        ChannelStream.objects.filter(
+            stream__name=TooManyStreams.STREAM_NAME,
+            stream__is_custom=True,
+        ).delete()
