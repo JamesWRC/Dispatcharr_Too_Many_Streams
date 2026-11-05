@@ -22,7 +22,7 @@ Older releases advertised by previous versions of this README are not covered by
 
 This contribution is **not yet a production-readiness claim**. Exact guarded host versions are **0.31.0 and 0.33.0**; other versions are rejected until their contracts are reviewed.
 
-- **Single-process listener ownership only.** Multiworker uWSGI/Celery ownership and reload coordination remain unimplemented. Do not enable this snapshot on a normal multiworker deployment without resolving that limitation.
+- **Multiworker hosts (uwsgi/Celery/Daphne) are supported.** The first process to start owns the loopback listener; other processes attach their hooks and share its stream URL after a health check. A busy port with no healthy TooManyStreams listener still fails closed rather than hijacking an unknown service.
 - Upgrading from the old plugin requires a clean application restart to remove its old monkeypatch, and removal of legacy custom `TooManyStreams` channel-stream associations **before enabling** this version. Back up and preview that migration first. Old warning URLs may use `0.0.0.0`, `localhost`, another port or a previous host, so matching only the new loopback URL is insufficient.
 - The retained **Prepare automatic capacity warning** action creates metadata only. It no longer appends a warning to every channel. Native provider/account limits and channel priorities remain authoritative.
 - Native HTTP 429 per-viewer rejections are intentionally unchanged. The warning is supplied at native URL resolution only after observed provider-capacity exhaustion; no fake provider profile or reserved slot is returned.
