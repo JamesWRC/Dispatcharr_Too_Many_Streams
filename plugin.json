@@ -1,6 +1,6 @@
 {
   "name": "too_many_streams",
-  "version": "2.2.3",
+  "version": "2.3.0",
   "description": "Handles scenarios where too many streams are open and what users see. Features a customizable dynamic splash screen.",
   "author": "JamesWRC",
   "fields": [
@@ -104,13 +104,13 @@
   "actions": [
     {
       "id": "apply_too_many_streams",
-      "label": "Apply 'Too Many Streams' to channels",
-      "description": "Adds the 'Too Many Streams' stream to the bottom of all channels."
+      "label": "Prepare automatic capacity warning",
+      "description": "Prepares warning metadata; no channel associations are added."
     },
     {
       "id": "remove_too_many_streams",
       "label": "Remove 'Too Many Streams' from channels",
-      "description": "Removes the 'Too Many Streams' stream from all channels."
+      "description": "Removes legacy warning associations only; does not stop healthy channels."
     },
     {
       "id": "save_plugin_config",

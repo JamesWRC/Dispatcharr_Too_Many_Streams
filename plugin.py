@@ -2,19 +2,9 @@
 """Too Many Streams Plugin for Dispatcharr"""
 # -*- coding: utf-8 -*-
 # Python imports
-import os
 import logging
-import socket
-import threading
-import sys
-import inspect
 
-# Configure logging as early as possible
 logger = logging.getLogger('plugins.too_many_streams')
-log_file = os.path.join(os.path.dirname(__file__), "debug.log")
-file_handler = logging.FileHandler(log_file)
-file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
-logger.addHandler(file_handler)
 logger.setLevel(logging.INFO)
 
 try:
@@ -22,12 +12,7 @@ try:
     from .src.TooManyStreams import TooManyStreams
     from .src.TooManyStreamsConfig import TooManyStreamsConfig
     
-    # Safely log the source path
-    try:
-        source_path = inspect.getfile(TooManyStreamsConfig)
-        logger.info(f"Imported TooManyStreamsConfig from {source_path}")
-    except Exception:
-        logger.info("Imported TooManyStreamsConfig (could not determine source path)")
+    logger.info("Imported TooManyStreams components")
         
 except Exception as e:
     logger.error(f"Failed to import plugin components: {e}", exc_info=True)
@@ -36,7 +21,7 @@ except Exception as e:
 
 class Plugin:
     name = "too_many_streams"
-    version = "2.1.3"
+    version = "2.3.0"
     description = "Handles scenarios where too many streams are open and what users see."
     initialized = False
 
@@ -153,18 +138,18 @@ class Plugin:
     actions = [
         {
             "id": "apply_too_many_streams",
-            "label": "Apply 'Too Many Streams' to channels",
-            "description": "Adds the 'Too Many Streams' stream to the bottom of all channels.",
+            "label": "Prepare automatic capacity warning",
+            "description": "Prepares warning metadata; no channel associations are added.",
             "confirm": {
                 "required": True,
                 "title": "Apply 'Too Many Streams'?",
-                "message": "This adds the 'Too Many Streams' stream to the bottom of all channels.",
+                "message": "Prepare automatic capacity warning without changing channels?",
             },
         },
         {
             "id": "remove_too_many_streams",
             "label": "Remove 'Too Many Streams' from channels",
-            "description": "Removes the 'Too Many Streams' stream from all channels.",
+            "description": "Removes legacy warning associations only; does not stop healthy channels.",
             "confirm": {
                 "required": True,
                 "title": "Remove 'Too Many Streams'?",
@@ -189,48 +174,23 @@ class Plugin:
     ]    
 
     def __init__(self):
+        self.initialized = False
         self.initialize()
 
     def initialize(self):
         if self.initialized:
             return
-            
         config = TooManyStreamsConfig.get_config()
         logger.setLevel(config.tms_log_level)
-
-        HOST, PORT = TooManyStreamsConfig.get_host_and_port()
-        image_to_use = config.tms_image_path
-
-        TooManyStreams.install_get_stream_override()
-        TooManyStreams.install_stream_manager_log_filter()
-
-        if not self._can_bind(HOST, PORT):
-            logger.error(f"Too Many Streams: Could not bind to {HOST}:{PORT}. Port might be in use.")
-            return
-
-        if not TooManyStreams.check_requirements_met():
-            TooManyStreams.install_requirements()
-
-        threading.Thread(
-            target=TooManyStreams.stream_still_mpegts_http_thread,
-            args=(image_to_use,),
-            kwargs={"host": HOST, "port": PORT},
-            daemon=True,
-        ).start()
-            
+        host, port = TooManyStreamsConfig.get_host_and_port()
+        TooManyStreams.start(config.tms_image_path, host=host, port=port)
         self.initialized = True
         logger.info("Too Many Streams plugin initialized.")
 
-    @staticmethod
-    def _can_bind(host, port) -> bool:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.bind((host, port))
-            s.close()
-            return True
-        except OSError:
-            s.close()
-            return False
+    def stop(self, context=None):
+        """Dispatcharr's loader invokes this before disable/reload/removal."""
+        TooManyStreams.stop()
+        self.initialized = False
 
     def run(self, action: str = None, params: dict = None, context: dict = None, *args, **kwargs):
         self.initialize()
